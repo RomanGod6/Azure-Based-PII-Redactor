@@ -1,0 +1,47 @@
+[tool.poetry]
+name = "pii-redactor-pro"
+version = "1.0.0"
+description = "A modern Python GUI application for redacting PII from CSV files using Azure AI"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.9,!=3.9.7,<4.0"
+pandas = "^2.1.4"
+numpy = "^1.24.0"
+azure-ai-textanalytics = "^5.3.0"
+azure-core = "^1.29.6"
+python-dotenv = "^1.0.0"
+openpyxl = "^3.1.2"
+streamlit = "^1.28.0"
+plotly = "^5.17.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+black = "^23.0.0"
+flake8 = "^5.0.4"
+isort = "^5.12.0"
+mypy = "^1.5.0"
+
+[tool.poetry.scripts]
+pii-redactor = "pii_redactor_app:main"
+batch-process = "batch_process:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
