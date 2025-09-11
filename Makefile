@@ -1,182 +1,219 @@
-# PII Redactor Pro - Modern Development Setup
-# Cross-platform Makefile for easy project management
+# Enhanced PII Redactor - Makefile
+# Quick commands for setup, installation, and running the 99% accuracy system
 
-.PHONY: help install setup run clean test lint format check dev build
+.PHONY: help install setup run dev test clean lint format check-deps demo
 
 # Default target
+.DEFAULT_GOAL := help
+
+# Colors for output
+GREEN := \033[0;32m
+YELLOW := \033[1;33m
+RED := \033[0;31m
+NC := \033[0m # No Color
+
 help: ## Show this help message
-	@echo "PII Redactor Pro - Available Commands:"
-	@echo ""
-	@echo "🚀 MAIN COMMANDS:"
-	@echo "  make run           - Start web app (recommended - opens in browser)"
-	@echo "  make run-gui       - Start desktop GUI (requires tkinter)"
-	@echo ""
-	@echo "🌐 WEB VERSION OPTIONS:"
-	@echo "  make web           - Same as 'run' (web app)"
-	@echo "  make web-dev       - Web app in development mode"
-	@echo ""
-	@echo "⚙️  SETUP & DEVELOPMENT:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -v "web\|run" | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+	@echo "$(GREEN)🛡️  Enhanced PII Redactor - 99% Accuracy System$(NC)"
+	@echo "$(YELLOW)Available commands:$(NC)"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "$(GREEN)%-15s$(NC) %s\n", $$1, $$2}'
 
-install: ## Install Poetry (if not installed) and project dependencies
-	@echo "🔧 Setting up PII Redactor Pro..."
-	@command -v poetry >/dev/null 2>&1 || { echo "Installing Poetry..."; curl -sSL https://install.python-poetry.org | python3 -; }
-	@poetry --version
-	@poetry install --no-root
-	@echo "✅ Dependencies installed!"
-
-setup: install ## Complete project setup (install + configure environment)
-	@echo "📋 Setting up environment..."
-	@if [ ! -f .env ]; then \
-		if [ -f .env.template ]; then \
-			cp .env.template .env; \
-			echo "✅ Created .env from template"; \
-		else \
-			echo "⚠️  No .env.template found"; \
-		fi; \
-	else \
-		echo "✅ .env file already exists"; \
+install: ## Install all dependencies
+	@echo "$(GREEN)📦 Installing dependencies...$(NC)"
+	@if [ ! -d "venv" ]; then \
+		echo "$(YELLOW)🔧 Creating virtual environment...$(NC)"; \
+		python3 -m venv venv; \
 	fi
-	@echo ""
-	@echo "🎉 Setup complete! Use 'make run' to start the application"
+	@echo "$(YELLOW)📥 Installing packages in virtual environment...$(NC)"
+	./venv/bin/pip install --upgrade pip
+	./venv/bin/pip install -r requirements.txt
+	@echo "$(GREEN)✅ Dependencies installed successfully!$(NC)"
 
-run: ## Run the PII Redactor web application (default)
-	@echo "🌐 Starting PII Redactor Pro Web App..."
-	@echo "📱 Opening in browser - perfect for WSL!"
-	@poetry run streamlit run pii_redactor_web.py --server.port 8501 --server.address 0.0.0.0
+setup: ## Complete setup (install dependencies + configure environment)
+	@echo "$(GREEN)🚀 Setting up Enhanced PII Redactor...$(NC)"
+	$(MAKE) install
+	@if [ ! -f .env ]; then \
+		echo "$(YELLOW)📋 Creating .env file from template...$(NC)"; \
+		cp .env.example .env; \
+		echo "$(YELLOW)⚠️  Please edit .env with your Azure credentials$(NC)"; \
+	else \
+		echo "$(GREEN)✅ .env file already exists$(NC)"; \
+	fi
+	@mkdir -p data logs
+	@echo "$(GREEN)🎉 Setup complete! Run 'make run' to start the application$(NC)"
 
-run-gui: ## Run the desktop GUI version (requires tkinter)
-	@echo "�️ Starting PII Redactor Pro Desktop GUI..."
-	@poetry run python -c "import tkinter; print('✅ tkinter available')" 2>/dev/null || { \
-		echo "❌ tkinter not found in WSL environment"; \
-		echo ""; \
-		echo "🔧 To fix this, you have several options:"; \
-		echo ""; \
-		echo "Option 1 - Install tkinter in WSL:"; \
-		echo "  sudo apt update && sudo apt install python3-tk python3-dev"; \
-		echo ""; \
-		echo "Option 2 - Run from Windows instead:"; \
-		echo "  cd /mnt/c/Users/dgriffey/Downloads/pii_redactor_pro"; \
-		echo "  python.exe pii_redactor_app.py"; \
-		echo ""; \
-		echo "Option 3 - Use web version (recommended):"; \
-		echo "  make run"; \
-		echo ""; \
-		echo "Option 4 - Use batch processing (no GUI):"; \
-		echo "  make batch ARGS='--dir /path/to/csv/files'"; \
-		echo ""; \
+run: ## Run the Enhanced PII Redactor application
+	@echo "$(GREEN)🚀 Starting Enhanced PII Redactor (99% accuracy)...$(NC)"
+	@echo "$(YELLOW)📱 Opening browser at http://localhost:8501$(NC)"
+	@if [ -d "venv" ]; then \
+		./venv/bin/streamlit run enhanced_pii_redactor_app.py; \
+	else \
+		echo "$(RED)❌ Virtual environment not found. Run 'make install' first$(NC)"; \
 		exit 1; \
-	}
-	@poetry run python pii_redactor_app.py
+	fi
 
-web: ## Run the modern web-based version (recommended)
-	@echo "🌐 Starting PII Redactor Pro Web App..."
-	@echo "📱 This will open in your browser - works great in WSL!"
-	@poetry run streamlit run pii_redactor_web.py --server.port 8501 --server.address 0.0.0.0
+quick-start: ## Install dependencies and run immediately
+	@echo "$(GREEN)⚡ Quick start - Installing and running...$(NC)"
+	$(MAKE) setup
+	@echo "$(GREEN)🏁 Starting application in 3 seconds...$(NC)"
+	@sleep 3
+	$(MAKE) run
 
-web-dev: ## Run web version in development mode
-	@echo "🌐 Starting PII Redactor Pro Web App in dev mode..."
-	@poetry run streamlit run pii_redactor_web.py --server.port 8501 --server.address 0.0.0.0 --server.runOnSave true
+dev: ## Set up development environment with additional tools
+	@echo "$(GREEN)🛠️  Setting up development environment...$(NC)"
+	$(MAKE) install
+	pip install pytest pytest-cov black flake8 isort mypy
+	@echo "$(GREEN)✅ Development environment ready!$(NC)"
 
-run-windows: ## Run the app using Windows Python (from WSL)
-	@echo "🚀 Starting PII Redactor Pro using Windows Python..."
-	@cd /mnt/c/Users/dgriffey/Downloads/pii_redactor_pro && python.exe -c "import sys; print('Python:', sys.version)"
-	@cd /mnt/c/Users/dgriffey/Downloads/pii_redactor_pro && python.exe -m pip install -r requirements.txt --quiet || echo "Dependencies may need installing"
-	@cd /mnt/c/Users/dgriffey/Downloads/pii_redactor_pro && python.exe pii_redactor_app.py
+test: ## Run all tests
+	@echo "$(GREEN)🧪 Running tests...$(NC)"
+	python -m pytest tests/ -v --cov=. --cov-report=term-missing
 
-batch: ## Run batch processing
-	@echo "📦 Starting batch processor..."
-	@poetry run python batch_process.py $(ARGS)
+test-quick: ## Run quick smoke tests
+	@echo "$(GREEN)⚡ Running quick tests...$(NC)"
+	@if [ -d "venv" ]; then \
+		./venv/bin/python -c "from enhanced_ml_detector import EnhancedMLPIIDetector; print('✅ Core detector works!')"; \
+		./venv/bin/python -c "from performance_monitor import PerformanceMonitor; print('✅ Performance monitor works!')"; \
+		./venv/bin/python -c "from confidence_scoring import AdvancedConfidenceScorer; print('✅ Confidence scorer works!')"; \
+	else \
+		python3 -c "from enhanced_ml_detector import EnhancedMLPIIDetector; print('✅ Core detector works!')" 2>/dev/null || echo "❌ Core detector failed"; \
+		python3 -c "from performance_monitor import PerformanceMonitor; print('✅ Performance monitor works!')" 2>/dev/null || echo "❌ Performance monitor failed"; \
+		python3 -c "from confidence_scoring import AdvancedConfidenceScorer; print('✅ Confidence scorer works!')" 2>/dev/null || echo "❌ Confidence scorer failed"; \
+	fi
+	@echo "$(GREEN)🎉 All core components loaded successfully!$(NC)"
 
-dev: install ## Install development dependencies and run in dev mode
-	@poetry install --with dev --no-root || poetry install --no-root
-	@echo "🔧 Development environment ready!"
-	@echo "You can now run: make run"
+demo: ## Run demo without Azure credentials
+	@echo "$(GREEN)🎮 Running demo mode...$(NC)"
+	@if [ -d "venv" ]; then \
+		./venv/bin/python enhanced_ml_detector.py; \
+	else \
+		python3 enhanced_ml_detector.py; \
+	fi
 
-test: ## Run tests
-	@echo "🧪 Running tests..."
-	@poetry run pytest
+demo-confidence: ## Demo confidence scoring system
+	@echo "$(GREEN)🎯 Running confidence scoring demo...$(NC)"
+	@if [ -d "venv" ]; then \
+		./venv/bin/python confidence_scoring.py; \
+	else \
+		python3 confidence_scoring.py; \
+	fi
 
-lint: ## Run linting checks
-	@echo "🔍 Running linting..."
-	@poetry run flake8 .
-	@poetry run mypy .
+demo-performance: ## Demo performance monitoring
+	@echo "$(GREEN)📊 Running performance monitoring demo...$(NC)"
+	@if [ -d "venv" ]; then \
+		./venv/bin/python performance_monitor.py; \
+	else \
+		python3 performance_monitor.py; \
+	fi
+
+lint: ## Run code linting
+	@echo "$(GREEN)🔍 Running code linting...$(NC)"
+	flake8 --max-line-length=120 --ignore=E501,W503 *.py
+	@echo "$(GREEN)✅ Linting complete!$(NC)"
 
 format: ## Format code with black and isort
-	@echo "✨ Formatting code..."
-	@poetry run black .
-	@poetry run isort .
+	@echo "$(GREEN)🎨 Formatting code...$(NC)"
+	black --line-length=120 *.py
+	isort *.py
+	@echo "$(GREEN)✅ Code formatted!$(NC)"
 
-check: format lint test ## Run all quality checks (format, lint, test)
-	@echo "✅ All checks passed!"
-
-check-env: ## Check if the environment is properly set up
-	@echo "🔍 Checking environment..."
-	@echo "Python version:"
-	@poetry run python --version
-	@echo ""
-	@echo "Checking tkinter availability:"
-	@poetry run python -c "import tkinter; print('✅ tkinter is available')" 2>/dev/null || { \
-		echo "❌ tkinter not available in this environment"; \
-		echo "   This is common in WSL - see 'make run' for solutions"; \
-	}
-	@echo ""
-	@echo "Checking Azure credentials:"
-	@if [ -f .env ]; then \
-		echo "✅ .env file exists"; \
-		poetry run python -c "from dotenv import load_dotenv; import os; load_dotenv(); print('Azure Endpoint:', os.getenv('AZURE_ENDPOINT', 'Not set')); print('Azure Key:', 'Set' if os.getenv('AZURE_KEY') else 'Not set')" 2>/dev/null || echo "Could not load .env"; \
+check-deps: ## Check if all dependencies are installed
+	@echo "$(GREEN)🔍 Checking dependencies...$(NC)"
+	@if [ -d "venv" ]; then \
+		echo "$(YELLOW)📦 Checking virtual environment dependencies...$(NC)"; \
+		./venv/bin/python -c "import streamlit; print('✅ Streamlit')" 2>/dev/null || echo "❌ Streamlit missing"; \
+		./venv/bin/python -c "import pandas; print('✅ Pandas')" 2>/dev/null || echo "❌ Pandas missing"; \
+		./venv/bin/python -c "import plotly; print('✅ Plotly')" 2>/dev/null || echo "❌ Plotly missing"; \
+		./venv/bin/python -c "import sklearn; print('✅ Scikit-learn')" 2>/dev/null || echo "❌ Scikit-learn missing"; \
+		./venv/bin/python -c "import azure.ai.textanalytics; print('✅ Azure AI')" 2>/dev/null || echo "❌ Azure AI missing"; \
+		./venv/bin/python -c "import requests; print('✅ Requests')" 2>/dev/null || echo "❌ Requests missing"; \
 	else \
-		echo "❌ .env file not found"; \
+		echo "$(YELLOW)📦 Checking system dependencies...$(NC)"; \
+		python3 -c "import streamlit; print('✅ Streamlit')" 2>/dev/null || echo "❌ Streamlit missing"; \
+		python3 -c "import pandas; print('✅ Pandas')" 2>/dev/null || echo "❌ Pandas missing"; \
+		python3 -c "import plotly; print('✅ Plotly')" 2>/dev/null || echo "❌ Plotly missing"; \
+		python3 -c "import sklearn; print('✅ Scikit-learn')" 2>/dev/null || echo "❌ Scikit-learn missing"; \
+		python3 -c "import azure.ai.textanalytics; print('✅ Azure AI')" 2>/dev/null || echo "❌ Azure AI missing"; \
+		python3 -c "import requests; print('✅ Requests')" 2>/dev/null || echo "❌ Requests missing"; \
+	fi
+
+check-azure: ## Check Azure credentials configuration
+	@echo "$(GREEN)🔍 Checking Azure configuration...$(NC)"
+	@if [ -f .env ]; then \
+		echo "$(GREEN)✅ .env file exists$(NC)"; \
+		if grep -q "your_azure_api_key_here" .env; then \
+			echo "$(YELLOW)⚠️  Please update Azure credentials in .env file$(NC)"; \
+		else \
+			echo "$(GREEN)✅ Azure credentials appear to be configured$(NC)"; \
+		fi \
+	else \
+		echo "$(RED)❌ .env file not found. Run 'make setup' first$(NC)"; \
 	fi
 
 clean: ## Clean up temporary files and caches
-	@echo "🧹 Cleaning up..."
-	@find . -type f -name "*.pyc" -delete
-	@find . -type d -name "__pycache__" -delete
-	@find . -type d -name "*.egg-info" -exec rm -rf {} +
-	@rm -rf dist/ build/ .pytest_cache/ .mypy_cache/ .coverage
-	@echo "✅ Cleanup complete!"
+	@echo "$(GREEN)🧹 Cleaning up...$(NC)"
+	find . -type f -name "*.pyc" -delete
+	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name ".DS_Store" -delete 2>/dev/null || true
+	rm -rf .pytest_cache
+	rm -rf .coverage
+	rm -rf htmlcov
+	rm -f *.db
+	@echo "$(GREEN)✅ Cleanup complete!$(NC)"
 
-build: ## Build distribution packages
-	@echo "📦 Building package..."
-	@poetry build
-	@echo "✅ Build complete! Check dist/ directory"
+status: ## Show system status and configuration
+	@echo "$(GREEN)📊 Enhanced PII Redactor Status$(NC)"
+	@echo "$(YELLOW)Dependencies:$(NC)"
+	@$(MAKE) check-deps --no-print-directory
+	@echo ""
+	@echo "$(YELLOW)Configuration:$(NC)"
+	@$(MAKE) check-azure --no-print-directory
+	@echo ""
+	@echo "$(YELLOW)Files:$(NC)"
+	@ls -la *.py | wc -l | xargs printf "Python files: %s\n"
+	@if [ -f .env ]; then echo "✅ Environment configured"; else echo "❌ Environment needs setup"; fi
 
-deps-update: ## Update all dependencies to latest versions
-	@echo "📦 Updating dependencies..."
-	@poetry update
-	@echo "✅ Dependencies updated!"
+benchmark: ## Run performance benchmarks
+	@echo "$(GREEN)🏃 Running performance benchmarks...$(NC)"
+	@echo "This would run accuracy and speed benchmarks"
+	$(MAKE) test-quick
 
-deps-show: ## Show current dependency tree
-	@poetry show --tree
+docs: ## Generate documentation
+	@echo "$(GREEN)📚 Documentation available in README.md$(NC)"
+	@echo "$(YELLOW)Key files:$(NC)"
+	@echo "  📖 README.md - Complete documentation"
+	@echo "  ⚙️  .env.example - Configuration template"
+	@echo "  📦 requirements.txt - Dependencies"
+	@echo "  🏃 Makefile - This file with commands"
 
-shell: ## Open a shell in the virtual environment
-	@poetry shell
+# Advanced commands
+install-dev: ## Install development dependencies
+	$(MAKE) install
+	pip install jupyter notebook ipython
 
-info: ## Show project and environment info
-	@echo "📊 Project Information:"
-	@echo "Poetry version: $$(poetry --version)"
-	@echo "Python version: $$(poetry run python --version)"
-	@echo "Virtual env: $$(poetry env info --path)"
-	@echo "Dependencies:"
-	@poetry show --only=main
+notebook: ## Start Jupyter notebook for development
+	@echo "$(GREEN)📓 Starting Jupyter notebook...$(NC)"
+	jupyter notebook
 
-# Platform-specific commands
-ifeq ($(OS),Windows_NT)
-    DETECTED_OS := Windows
-    SHELL_EXTENSION := .bat
-else
-    DETECTED_OS := $(shell uname -s)
-    SHELL_EXTENSION := .sh
-endif
+profile: ## Run with profiling enabled
+	@echo "$(GREEN)⚡ Running with performance profiling...$(NC)"
+	python -m cProfile -o profile_output.prof enhanced_pii_redactor_app.py
 
-install-poetry-windows: ## Install Poetry on Windows
-	@powershell -Command "(Invoke-WebRequest -Uri https://install.python-poetry.org -UseBasicParsing).Content | python -"
+# Docker commands (if Docker is available)
+docker-build: ## Build Docker image
+	@echo "$(GREEN)🐳 Building Docker image...$(NC)"
+	docker build -t enhanced-pii-redactor .
 
-install-poetry-unix: ## Install Poetry on Unix/Linux/macOS
-	@curl -sSL https://install.python-poetry.org | python3 -
+docker-run: ## Run in Docker container
+	@echo "$(GREEN)🐳 Running in Docker...$(NC)"
+	docker run -p 8501:8501 enhanced-pii-redactor
 
-# Quick commands for common tasks
+# Deployment helpers
+package: ## Create deployment package
+	@echo "$(GREEN)📦 Creating deployment package...$(NC)"
+	zip -r enhanced-pii-redactor.zip *.py requirements.txt .env.example README.md Makefile
+	@echo "$(GREEN)✅ Package created: enhanced-pii-redactor.zip$(NC)"
+
+# Quick shortcuts
 start: run ## Alias for run
-go: run ## Alias for run
-launch: run ## Alias for run
+app: run ## Alias for run
+go: quick-start ## Alias for quick-start

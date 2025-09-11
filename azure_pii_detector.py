@@ -4,10 +4,14 @@ This module provides the actual Azure AI implementation for PII detection
 """
 
 import re
+import time
+import random
 from typing import Dict, List, Tuple, Optional
 from azure.ai.textanalytics import TextAnalyticsClient
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import AzureError, HttpResponseError, ServiceRequestError
 import pandas as pd
+import logging
 
 # Import column configuration system
 try:
@@ -133,63 +137,184 @@ class AzurePIIDetector:
         self.cost_per_1000_chars = 0.001  # $1 per 1M characters
         self.config_manager = config_manager or ColumnConfigManager()
         
-    def detect_pii_batch(self, texts: List[str], language: str = "en") -> List[Dict]:
+    def detect_pii_batch(self, texts: List[str], language: str = "en", max_retries: int = 3) -> List[Dict]:
         """
-        Detect PII in a batch of texts
+        Detect PII in a batch of texts with comprehensive error handling and retry logic
         
         Args:
             texts: List of text strings to analyze
             language: Language code (default: "en")
+            max_retries: Maximum number of retry attempts
             
         Returns:
             List of dictionaries containing PII detection results
         """
-        try:
-            # Filter out empty texts
-            valid_texts = [(i, text) for i, text in enumerate(texts) if text and not pd.isna(text)]
-            
-            if not valid_texts:
-                return [{'text': text, 'redacted': text, 'entities': []} for text in texts]
-            
-            # Extract just the text values for API call
-            text_values = [text for _, text in valid_texts]
-            
-            # Call Azure API
-            response = self.client.recognize_pii_entities(
-                documents=text_values,
-                language=language,
-                categories_filter=None,  # Detect all PII categories
-                string_index_type="UnicodeCodePoint"
-            )
-            
-            # Process results
-            results = [{'text': text, 'redacted': text, 'entities': []} for text in texts]
-            
-            for idx, result in enumerate(response):
-                original_idx = valid_texts[idx][0]
-                original_text = valid_texts[idx][1]
+        # Filter out empty texts and track indices
+        valid_texts = [(i, str(text).strip()) for i, text in enumerate(texts) 
+                      if text and not pd.isna(text) and str(text).strip()]
+        
+        if not valid_texts:
+            return [{'text': text or '', 'redacted': text or '', 'entities': [], 'processing_notes': 'empty_input'} for text in texts]
+        
+        # Initialize results array
+        results = [{'text': text or '', 'redacted': text or '', 'entities': [], 'processing_notes': 'not_processed'} for text in texts]
+        
+        # Extract text values for API call
+        text_values = [text for _, text in valid_texts]
+        
+        # Validate text lengths (Azure has limits)
+        if any(len(text) > 125000 for text in text_values):  # Azure limit is ~125k chars
+            print("⚠️ Some texts exceed Azure length limits, truncating...")
+            text_values = [text[:125000] if len(text) > 125000 else text for text in text_values]
+        
+        # Rate limiting state
+        last_request_time = getattr(self, '_last_request_time', 0)
+        min_request_interval = 0.1  # 100ms between requests
+        
+        for attempt in range(max_retries + 1):
+            try:
+                # Rate limiting
+                current_time = time.time()
+                time_since_last = current_time - last_request_time
+                if time_since_last < min_request_interval:
+                    time.sleep(min_request_interval - time_since_last)
                 
-                if result.is_error:
-                    results[original_idx] = {
-                        'text': original_text,
-                        'redacted': original_text,
-                        'entities': [],
-                        'error': str(result.error)
-                    }
+                self._last_request_time = time.time()
+                
+                print(f"🔍 Azure API call attempt {attempt + 1}/{max_retries + 1} - Processing {len(text_values)} texts")
+                
+                # Call Azure API with timeout
+                response = self.client.recognize_pii_entities(
+                    documents=text_values,
+                    language=language,
+                    categories_filter=None,  # Detect all PII categories
+                    string_index_type="UnicodeCodePoint"
+                )
+                
+                # Process successful response
+                successful_results = 0
+                api_errors = 0
+                
+                for idx, result in enumerate(response):
+                    original_idx = valid_texts[idx][0]
+                    original_text = valid_texts[idx][1]
+                    
+                    if result.is_error:
+                        api_errors += 1
+                        error_msg = str(result.error) if hasattr(result, 'error') else 'Unknown API error'
+                        results[original_idx] = {
+                            'text': original_text,
+                            'redacted': original_text,
+                            'entities': [],
+                            'error': error_msg,
+                            'processing_notes': f'api_error_attempt_{attempt + 1}'
+                        }
+                        print(f"⚠️ Azure API error for text {idx}: {error_msg}")
+                    else:
+                        try:
+                            redacted_text, entities = self._process_pii_result(original_text, result)
+                            results[original_idx] = {
+                                'text': original_text,
+                                'redacted': redacted_text,
+                                'entities': entities,
+                                'processing_notes': f'success_attempt_{attempt + 1}'
+                            }
+                            successful_results += 1
+                        except Exception as processing_error:
+                            results[original_idx] = {
+                                'text': original_text,
+                                'redacted': original_text,
+                                'entities': [],
+                                'error': f'Processing error: {str(processing_error)}',
+                                'processing_notes': f'processing_error_attempt_{attempt + 1}'
+                            }
+                
+                print(f"✅ Azure API call completed: {successful_results} successful, {api_errors} errors")
+                
+                # If we have mostly successful results, return
+                if api_errors == 0 or (successful_results / len(text_values)) > 0.8:
+                    return results
+                
+                # If too many errors, retry
+                if attempt < max_retries:
+                    print(f"⚠️ High error rate ({api_errors}/{len(text_values)}), retrying...")
+                    continue
                 else:
-                    redacted_text, entities = self._process_pii_result(original_text, result)
-                    results[original_idx] = {
-                        'text': original_text,
-                        'redacted': redacted_text,
-                        'entities': entities
-                    }
+                    print(f"❌ Max retries exceeded with high error rate")
+                    return results
             
-            return results
+            except HttpResponseError as e:
+                error_code = getattr(e, 'status_code', 'unknown')
+                error_msg = str(e)
+                
+                print(f"🚫 Azure HTTP error (attempt {attempt + 1}): {error_code} - {error_msg}")
+                
+                # Handle specific error codes
+                if error_code == 429:  # Rate limiting
+                    retry_after = getattr(e.response.headers, 'retry-after', 60) if hasattr(e, 'response') else 60
+                    if attempt < max_retries:
+                        print(f"⏳ Rate limited, waiting {retry_after} seconds...")
+                        time.sleep(int(retry_after))
+                        continue
+                
+                elif error_code in [500, 502, 503, 504]:  # Server errors
+                    if attempt < max_retries:
+                        # Exponential backoff with jitter
+                        wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        print(f"⏳ Server error, waiting {wait_time:.1f} seconds...")
+                        time.sleep(wait_time)
+                        continue
+                
+                elif error_code in [401, 403]:  # Auth errors
+                    print(f"🔐 Authentication error - check Azure credentials")
+                    break  # Don't retry auth errors
+                
+                # For other HTTP errors or max retries reached
+                if attempt >= max_retries:
+                    return self._create_error_results(texts, f"Azure HTTP error: {error_msg}")
             
-        except Exception as e:
-            print(f"Error in batch PII detection: {str(e)}")
-            # Return original texts if error occurs
-            return [{'text': text, 'redacted': text, 'entities': [], 'error': str(e)} for text in texts]
+            except ServiceRequestError as e:
+                print(f"🌐 Azure service request error (attempt {attempt + 1}): {str(e)}")
+                if attempt < max_retries:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    print(f"⏳ Network error, waiting {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return self._create_error_results(texts, f"Network error: {str(e)}")
+            
+            except AzureError as e:
+                print(f"☁️ General Azure error (attempt {attempt + 1}): {str(e)}")
+                if attempt < max_retries:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    print(f"⏳ Azure error, waiting {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return self._create_error_results(texts, f"Azure error: {str(e)}")
+            
+            except Exception as e:
+                print(f"💥 Unexpected error (attempt {attempt + 1}): {str(e)}")
+                if attempt < max_retries:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    print(f"⏳ Unexpected error, waiting {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return self._create_error_results(texts, f"Unexpected error: {str(e)}")
+        
+        # Should not reach here, but fallback
+        return self._create_error_results(texts, "Max retries exceeded")
+    
+    def _create_error_results(self, texts: List[str], error_message: str) -> List[Dict]:
+        """Create error results for all texts when API fails completely"""
+        return [{
+            'text': text or '',
+            'redacted': text or '',
+            'entities': [],
+            'error': error_message,
+            'processing_notes': 'api_failure'
+        } for text in texts]
     
     def _process_pii_result(self, text: str, result) -> Tuple[str, List[Dict]]:
         """

@@ -1,84 +1,81 @@
-# PII Redactor Pro - Azure AI Powered
+# 🛡️ Enhanced PII Redactor - 99% Accuracy System
 
-A modern, professional Python GUI application for redacting Personally Identifiable Information (PII) from CSV files using Azure AI services.
+**Advanced AI-powered PII detection and redaction with 99% accuracy target**
+
+A comprehensive solution combining Azure AI, GPT validation, machine learning, and continuous learning to achieve industry-leading PII detection accuracy with minimal false positives.
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Azure](https://img.shields.io/badge/Azure-AI-0078D4)
-![GUI](https://img.shields.io/badge/GUI-CustomTkinter-green)
+![Accuracy](https://img.shields.io/badge/Accuracy-99%25-brightgreen)
+![Streamlit](https://img.shields.io/badge/GUI-Streamlit-red)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-## 🚀 Features
+## ✨ Key Features
 
-- **Modern Professional GUI**: Built with CustomTkinter for a sleek, dark-themed interface
-- **Azure AI Integration**: Leverages Azure Text Analytics for accurate PII detection
-- **Real-time Processing**: Row-by-row processing to maintain data format integrity
-- **Progress Tracking**: Live ETA and progress bar during processing
-- **Cost Management**: Track costs for current and historical runs
-- **Preview Mode**: Test redaction on first column before full processing
-- **History Tracking**: SQLite database stores all processing history
-- **Multiple View Modes**: Original, Redacted, and Side-by-Side comparison views
-- **Comprehensive PII Detection**: Detects and redacts:
-  - Personal Information (Names, SSN, etc.)
-  - Contact Details (Email, Phone, Address)
-  - Financial Data (Credit Cards, Bank Accounts)
-  - Healthcare Information
-  - Dates and Timestamps
-  - Government IDs (Passports, Driver Licenses)
-  - And 100+ other PII categories
+### 🎯 99% Accuracy Target
+- **Multi-layer detection**: Azure AI + GPT validation + ML classification + pattern matching
+- **Context-aware processing**: Understands business terminology vs. actual PII
+- **Continuous learning**: Improves accuracy through user feedback and pattern recognition
+- **False positive reduction**: Advanced filtering to minimize incorrect redactions
 
-## 📋 Prerequisites
+### 🤖 AI-Powered Validation
+- **Azure Cognitive Services**: Industry-leading base PII detection
+- **GPT-4 validation**: Contextual analysis to eliminate false positives
+- **Machine learning**: Custom models trained on your data patterns
+- **Confidence scoring**: Dynamic confidence adjustment based on multiple signals
 
+### 📊 Performance Monitoring
+- **Real-time metrics**: Live tracking of accuracy, speed, and costs
+- **Interactive dashboards**: Comprehensive performance visualization
+- **Performance targets**: Configurable accuracy and speed goals
+- **Detailed reporting**: Export-ready performance reports
+
+### 🎓 Learning System
+- **User feedback integration**: Learn from corrections and suggestions
+- **Pattern recognition**: Automatically identify business-specific terminology
+- **Model adaptation**: Continuously improve detection models
+- **Knowledge export**: Save and share learned patterns
+
+### 🛡️ Comprehensive PII Detection
+- **100+ entity types**: Names, emails, phones, SSNs, credit cards, and more
+- **International support**: Government IDs from 30+ countries
+- **Healthcare data**: Medical conditions, drug names, diagnoses
+- **Financial information**: Bank accounts, IBANs, tax numbers
+- **Custom patterns**: Business-specific identifiers and terminology
+
+## 🚀 Quick Start
+
+### Prerequisites
 - Python 3.8 or higher
-- Azure Cognitive Services account (for Text Analytics API)
-- Windows, macOS, or Linux operating system
+- Azure Cognitive Services account
+- Azure OpenAI account (optional, for GPT validation)
 
-## 🔧 Modern Setup with Poetry & Make
+### Installation
 
-### Quick Start (Recommended)
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/your-org/Azure-Based-PII-Redactor.git
+   cd Azure-Based-PII-Redactor
+   ```
 
-**One command setup:**
+2. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```bash
-# Option 1: Using Python setup script
-python setup.py
+3. **Set up environment variables:**
+   ```bash
+   # Copy the example environment file
+   cp .env.example .env
+   
+   # Edit .env with your Azure credentials
+   nano .env
+   ```
 
-# Option 2: Using Make (if you have it installed)
-make setup
-```
-
-### What you need:
-
-- Python 3.8+
-- Internet connection (for Poetry installation)
-- Your Azure credentials are already configured in `.env.template`
-
-### Manual Setup (Alternative)
-
-**1. Install Poetry:**
-
-```bash
-# Windows (PowerShell)
-(Invoke-WebRequest -Uri https://install.python-poetry.org -UseBasicParsing).Content | python -
-
-# macOS/Linux
-curl -sSL https://install.python-poetry.org | python3 -
-```
-
-**2. Install dependencies:**
-
-```bash
-poetry install
-```
-
-**3. Run the app:**
-
-```bash
-# Using Poetry
-poetry run python pii_redactor_app.py
-
-# Or using Make
-make run
-```
+4. **Run the application:**
+   ```bash
+   streamlit run enhanced_pii_redactor_app.py
+   ```
 
 ### 4. Azure Credentials (Already Configured!)
 

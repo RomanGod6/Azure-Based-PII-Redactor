@@ -151,3 +151,4 @@ Thumbs.db
 poetry.lock
 Test.csv
 sample_zendesk_data.csv
+gpt_validator.py

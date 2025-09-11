@@ -119,15 +119,25 @@ Respond with JSON only:
                 )
                 results.update(batch_results)
             except Exception as e:
-                print(f"Error validating {entity_type} entities: {e}")
-                # Default to keeping redaction on error
+                error_type = type(e).__name__
+                print(f"⚠️ Error validating {entity_type} entities ({error_type}): {e}")
+                
+                # Apply intelligent fallback instead of defaulting to redaction
                 for entity in entities:
+                    entity_text = entity['text'].lower().strip()
+                    
+                    # Apply business term detection as fallback
+                    is_business_term = self._is_likely_business_term(entity_text, entity_type, context)
+                    should_redact = not is_business_term
+                    confidence = 0.6 if should_redact else 0.4
+                    explanation = f"Validation failed ({error_type}) - {'business term detected' if not should_redact else 'defaulting to redact'}"
+                    
                     results[entity['text']] = ValidationResult(
-                        is_real_pii=True,
-                        confidence=0.5,
-                        explanation=f"Validation failed: {str(e)}",
-                        should_redact=True,
-                        suggested_action="redact"
+                        is_real_pii=should_redact,
+                        confidence=confidence,
+                        explanation=explanation,
+                        should_redact=should_redact,
+                        suggested_action="redact" if should_redact else "keep_original"
                     )
         
         return results
@@ -204,17 +214,40 @@ For each entity, determine if it's real PII or a false positive.
             return self._parse_validation_response(response_text, entities)
             
         except Exception as e:
-            print(f"GPT validation error: {e}")
-            # Default to keeping redaction
-            return {
-                entity['text']: ValidationResult(
-                    is_real_pii=True,
-                    confidence=0.5,
-                    explanation=f"GPT validation failed: {str(e)}",
-                    should_redact=True,
-                    suggested_action="redact"
-                ) for entity in entities
-            }
+            error_type = type(e).__name__
+            error_msg = str(e)
+            print(f"⚠️ GPT validation error ({error_type}): {error_msg}")
+            
+            # Apply intelligent fallback based on error type and context
+            fallback_results = {}
+            
+            for entity in entities:
+                entity_text = entity['text'].lower().strip()
+                entity_type = entity.get('category', 'Unknown')
+                
+                # Intelligent fallback logic
+                is_business_term = self._is_likely_business_term(entity_text, entity_type, context)
+                
+                if error_type in ['HttpResponseError', 'ServiceRequestError', 'TimeoutError', 'ConnectionError']:
+                    # Network errors - trust business term detection more
+                    should_redact = not is_business_term
+                    confidence = 0.7 if should_redact else 0.3
+                    explanation = f"Network error - {'business term detected' if not should_redact else 'likely PII'}"
+                else:
+                    # Other errors - be more conservative
+                    should_redact = not is_business_term or entity_type not in ['PersonType']
+                    confidence = 0.6 if should_redact else 0.4
+                    explanation = f"Validation error ({error_type}) - applying conservative filtering"
+                
+                fallback_results[entity['text']] = ValidationResult(
+                    is_real_pii=should_redact,
+                    confidence=confidence,
+                    explanation=explanation,
+                    should_redact=should_redact,
+                    suggested_action="redact" if should_redact else "keep_original"
+                )
+            
+            return fallback_results
     
     def _get_context_prompt(self, context: str, entity_type: str) -> str:
         """Get context-specific validation prompt"""
@@ -262,6 +295,52 @@ Entity type: {entity_type}
         }
         
         return context_prompts.get(context, context_prompts["general"])
+    
+    def _is_likely_business_term(self, entity_text: str, entity_type: str, context: str) -> bool:
+        """Conservative business term detection for fallback scenarios"""
+        text_lower = entity_text.lower().strip()
+        
+        # High-confidence business terms that are very likely false positives
+        definite_business_terms = {
+            'user', 'users', 'customer', 'customers', 'client', 'clients',
+            'contact', 'contacts', 'agent', 'agents', 'admin', 'admins',
+            'member', 'members', 'person', 'people', 'individual', 'individuals',
+            'employee', 'employees', 'staff', 'support', 'team', 'group',
+            'manager', 'managers', 'administrator', 'administrators',
+            'service', 'system', 'application', 'platform', 'portal',
+            'department', 'organization', 'company', 'business'
+        }
+        
+        if text_lower in definite_business_terms:
+            return True
+        
+        # Context-specific business terms
+        if context in ['support_ticket', 'zendesk']:
+            zendesk_terms = {
+                'external user', 'internal user', 'co-managed user', 'guest user',
+                'end user', 'power user', 'system user', 'portal user',
+                'zendesk user', 'zendesk agent', 'organization member'
+            }
+            if text_lower in zendesk_terms:
+                return True
+            
+            # Check for compound terms containing business keywords
+            business_keywords = ['user', 'customer', 'client', 'agent', 'member']
+            if any(keyword in text_lower for keyword in business_keywords) and len(text_lower) <= 20:
+                return True
+        
+        # PersonType entities that are short and common are likely business terms
+        if entity_type == 'PersonType':
+            if len(text_lower) <= 15 and any(term in text_lower for term in ['user', 'customer', 'client', 'agent', 'member', 'person']):
+                return True
+        
+        # Organization entities that are generic business terms
+        if entity_type == 'Organization':
+            generic_org_terms = ['company', 'organization', 'business', 'service', 'system', 'platform', 'application']
+            if text_lower in generic_org_terms:
+                return True
+        
+        return False
     
     def _parse_validation_response(self, response_text: str, entities: List[Dict]) -> Dict[str, ValidationResult]:
         """Parse GPT response and create ValidationResult objects"""
