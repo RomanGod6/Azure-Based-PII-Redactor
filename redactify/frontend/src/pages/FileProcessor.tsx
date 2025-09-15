@@ -45,6 +45,13 @@ export const FileProcessor: React.FC = () => {
   const [processingMode, setProcessingMode] = useState<'file' | 'text'>('file');
   const [showTrainer, setShowTrainer] = useState(false);
   const [originalContent, setOriginalContent] = useState('');
+  
+  // Filtering and pagination state
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedEntityTypes, setSelectedEntityTypes] = useState<Set<string>>(new Set());
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage] = useState(50);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Fetch training statistics when component mounts or step changes to options
@@ -291,6 +298,77 @@ export const FileProcessor: React.FC = () => {
     setStep('complete');
   };
 
+  // Filter and pagination logic
+  const filteredEntities = entities.filter(entity => {
+    // Search filter
+    if (searchQuery && !entity.text.toLowerCase().includes(searchQuery.toLowerCase())) {
+      return false;
+    }
+    
+    // Entity type filter
+    if (selectedEntityTypes.size > 0 && !selectedEntityTypes.has(entity.type)) {
+      return false;
+    }
+    
+    // Confidence filter
+    if (entity.confidence < confidenceThreshold / 100) {
+      return false;
+    }
+    
+    return true;
+  });
+
+  const totalPages = Math.ceil(filteredEntities.length / itemsPerPage);
+  const paginatedEntities = filteredEntities.slice(
+    (currentPage - 1) * itemsPerPage,
+    currentPage * itemsPerPage
+  );
+
+  // Get unique entity types with counts and average confidence
+  const entityTypeStats = entities.reduce((acc, entity) => {
+    if (!acc[entity.type]) {
+      acc[entity.type] = { count: 0, totalConfidence: 0, entities: [] };
+    }
+    acc[entity.type].count++;
+    acc[entity.type].totalConfidence += entity.confidence;
+    acc[entity.type].entities.push(entity);
+    return acc;
+  }, {} as Record<string, { count: number; totalConfidence: number; entities: typeof entities }>);
+
+  const entityTypes = Object.entries(entityTypeStats).map(([type, stats]) => ({
+    type,
+    count: stats.count,
+    avgConfidence: Math.round((stats.totalConfidence / stats.count) * 100),
+    entities: stats.entities
+  })).sort((a, b) => b.count - a.count);
+
+  // Bulk actions
+  const toggleEntityType = (type: string) => {
+    const newSelected = new Set(selectedEntityTypes);
+    if (newSelected.has(type)) {
+      newSelected.delete(type);
+    } else {
+      newSelected.add(type);
+    }
+    setSelectedEntityTypes(newSelected);
+    setCurrentPage(1); // Reset to first page when filtering
+  };
+
+  const bulkSkipEntityType = (type: string) => {
+    const typeEntities = entityTypeStats[type]?.entities || [];
+    const updatedEntities = entities.map(entity => 
+      entity.type === type ? { ...entity, approved: false } : entity
+    );
+    setEntities(updatedEntities);
+  };
+
+  const bulkIncludeEntityType = (type: string) => {
+    const updatedEntities = entities.map(entity => 
+      entity.type === type ? { ...entity, approved: true } : entity
+    );
+    setEntities(updatedEntities);
+  };
+
   const resetProcessor = () => {
     setFile(null);
     setTextInput('');
@@ -299,6 +377,11 @@ export const FileProcessor: React.FC = () => {
     setStep('upload');
     setProgress(0);
     setProgressMessage('');
+    // Reset filters
+    setSearchQuery('');
+    setSelectedEntityTypes(new Set());
+    setConfidenceThreshold(0);
+    setCurrentPage(1);
   };
 
   return (
@@ -634,38 +717,203 @@ export const FileProcessor: React.FC = () => {
           </div>
 
           {entities.length > 0 && (
-            <div className="card">
-              <h3 className="text-lg font-semibold text-gray-900 mb-4">Review Detected PII</h3>
-              <p className="text-sm text-gray-600 mb-4">
-                Review each detected PII entity below. Uncheck items you want to keep in the final output.
-              </p>
-              <div className="space-y-2 max-h-96 overflow-y-auto">
-                {entities.map((entity, index) => (
-                  <div key={index} className="flex items-center justify-between p-3 border rounded-lg">
-                    <div className="flex items-center space-x-3">
-                      <input
-                        type="checkbox"
-                        checked={entity.approved}
-                        onChange={() => toggleEntityApproval(index)}
-                        className="h-4 w-4 text-blue-600"
-                      />
-                      <div>
-                        <span className="font-medium text-gray-900">"{entity.text}"</span>
-                        <div className="flex items-center space-x-2 text-sm text-gray-500">
-                          <span className="px-2 py-1 bg-gray-100 rounded text-xs">{entity.type}</span>
-                          <span>{Math.round(entity.confidence * 100)}% confidence</span>
+            <>
+              {/* Search and Filters */}
+              <div className="card">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">🔍 Search & Filters</h3>
+                
+                {/* Search Bar */}
+                <div className="mb-4">
+                  <input
+                    type="text"
+                    placeholder="Search for specific text..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  />
+                </div>
+
+                {/* Entity Type Filters */}
+                <div className="mb-4">
+                  <h4 className="text-sm font-medium text-gray-700 mb-2">📊 Entity Types:</h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                    {entityTypes.map(({ type, count, avgConfidence }) => (
+                      <div key={type} className="flex items-center justify-between p-2 border border-gray-200 rounded">
+                        <label className="flex items-center cursor-pointer flex-1">
+                          <input
+                            type="checkbox"
+                            checked={selectedEntityTypes.has(type)}
+                            onChange={() => toggleEntityType(type)}
+                            className="h-4 w-4 text-blue-600 mr-2"
+                          />
+                          <div className="flex-1">
+                            <span className="text-sm font-medium">{type}</span>
+                            <div className="text-xs text-gray-500">
+                              {count} items · {avgConfidence}% avg confidence
+                            </div>
+                          </div>
+                        </label>
+                        <div className="flex space-x-1 ml-2">
+                          <button
+                            onClick={() => bulkSkipEntityType(type)}
+                            className="px-2 py-1 text-xs bg-red-100 text-red-700 rounded hover:bg-red-200"
+                            title="Skip all"
+                          >
+                            Skip All
+                          </button>
+                          <button
+                            onClick={() => bulkIncludeEntityType(type)}
+                            className="px-2 py-1 text-xs bg-green-100 text-green-700 rounded hover:bg-green-200"
+                            title="Include all"
+                          >
+                            Include All
+                          </button>
                         </div>
                       </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-sm font-medium text-gray-900">
-                        {entity.approved ? 'Will Redact' : 'Will Keep'}
-                      </div>
-                    </div>
+                    ))}
                   </div>
-                ))}
+                </div>
+
+                {/* Confidence Threshold */}
+                <div className="mb-4">
+                  <h4 className="text-sm font-medium text-gray-700 mb-2">🎚️ Minimum Confidence: {confidenceThreshold}%</h4>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={confidenceThreshold}
+                    onChange={(e) => setConfidenceThreshold(Number(e.target.value))}
+                    className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                  />
+                </div>
+
+                {/* Filter Summary */}
+                <div className="bg-gray-50 p-3 rounded-lg">
+                  <div className="text-sm text-gray-600">
+                    Showing <span className="font-medium">{filteredEntities.length}</span> of <span className="font-medium">{entities.length}</span> detected entities
+                    {selectedEntityTypes.size > 0 && (
+                      <span> · Filtered by: {Array.from(selectedEntityTypes).join(', ')}</span>
+                    )}
+                    {searchQuery && (
+                      <span> · Search: "{searchQuery}"</span>
+                    )}
+                  </div>
+                </div>
               </div>
-            </div>
+
+              {/* Results List */}
+              <div className="card">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">📋 Review Results</h3>
+                <p className="text-sm text-gray-600 mb-4">
+                  Review each detected PII entity below. Uncheck items you want to keep in the final output.
+                </p>
+
+                {filteredEntities.length === 0 ? (
+                  <div className="text-center py-8 text-gray-500">
+                    <div className="text-4xl mb-2">🔍</div>
+                    <p>No entities match your current filters</p>
+                    <button
+                      onClick={() => {
+                        setSearchQuery('');
+                        setSelectedEntityTypes(new Set());
+                        setConfidenceThreshold(0);
+                      }}
+                      className="mt-2 text-blue-600 hover:underline"
+                    >
+                      Clear all filters
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="space-y-2 mb-4">
+                      {paginatedEntities.map((entity, index) => {
+                        const globalIndex = entities.findIndex(e => e === entity);
+                        return (
+                          <div key={globalIndex} className="flex items-center justify-between p-3 border rounded-lg">
+                            <div className="flex items-center space-x-3">
+                              <input
+                                type="checkbox"
+                                checked={entity.approved}
+                                onChange={() => toggleEntityApproval(globalIndex)}
+                                className="h-4 w-4 text-blue-600"
+                              />
+                              <div>
+                                <span className="font-medium text-gray-900">"{entity.text}"</span>
+                                <div className="flex items-center space-x-2 text-sm text-gray-500">
+                                  <span className="px-2 py-1 bg-gray-100 rounded text-xs">{entity.type}</span>
+                                  <span>{Math.round(entity.confidence * 100)}% confidence</span>
+                                </div>
+                              </div>
+                            </div>
+                            <div className="text-right">
+                              <div className="text-sm font-medium text-gray-900">
+                                {entity.approved ? 'Will Redact' : 'Will Keep'}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Pagination */}
+                    {totalPages > 1 && (
+                      <div className="flex items-center justify-between border-t pt-4">
+                        <div className="text-sm text-gray-600">
+                          Showing {((currentPage - 1) * itemsPerPage) + 1} - {Math.min(currentPage * itemsPerPage, filteredEntities.length)} of {filteredEntities.length} results
+                        </div>
+                        <div className="flex space-x-2">
+                          <button
+                            onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+                            disabled={currentPage === 1}
+                            className="px-3 py-1 border rounded text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
+                          >
+                            Previous
+                          </button>
+                          {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                            const page = i + 1;
+                            return (
+                              <button
+                                key={page}
+                                onClick={() => setCurrentPage(page)}
+                                className={`px-3 py-1 border rounded text-sm ${
+                                  currentPage === page
+                                    ? 'bg-blue-600 text-white border-blue-600'
+                                    : 'hover:bg-gray-50'
+                                }`}
+                              >
+                                {page}
+                              </button>
+                            );
+                          })}
+                          {totalPages > 5 && (
+                            <>
+                              <span className="px-2">...</span>
+                              <button
+                                onClick={() => setCurrentPage(totalPages)}
+                                className={`px-3 py-1 border rounded text-sm ${
+                                  currentPage === totalPages
+                                    ? 'bg-blue-600 text-white border-blue-600'
+                                    : 'hover:bg-gray-50'
+                                }`}
+                              >
+                                {totalPages}
+                              </button>
+                            </>
+                          )}
+                          <button
+                            onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
+                            disabled={currentPage === totalPages}
+                            className="px-3 py-1 border rounded text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
+                          >
+                            Next
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </>
           )}
 
           <div className="flex justify-between">
