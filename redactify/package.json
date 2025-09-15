@@ -1,0 +1,79 @@
+{
+  "name": "redactify",
+  "version": "1.0.0",
+  "description": "Desktop PII Redactor with 99% Accuracy - Powered by Azure AI",
+  "main": "main.js",
+  "homepage": "./",
+  "scripts": {
+    "start": "electron .",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\" \"wait-on --timeout 60000 --interval 2000 http://localhost:3000 http://localhost:8080/health && electron . --no-sandbox\"",
+    "dev:frontend": "cd frontend && npm start",
+    "dev:backend": "cd backend && go run cmd/server/main.go",
+    "dev:electron-only": "wait-on http://localhost:3000 http://localhost:8080/health && electron . --no-sandbox",
+    "build": "npm run build:frontend && npm run build:backend",
+    "build:frontend": "cd frontend && npm run build",
+    "build:backend": "cd backend && go build -o ../dist/redactify-server cmd/server/main.go",
+    "build:electron": "electron-builder",
+    "build:all": "npm run build && npm run build:electron",
+    "test": "npm run test:frontend && npm run test:backend",
+    "test:frontend": "cd frontend && npm test",
+    "test:backend": "cd backend && go test ./...",
+    "lint": "npm run lint:frontend && npm run lint:backend",
+    "lint:frontend": "cd frontend && npm run lint",
+    "lint:backend": "cd backend && golangci-lint run",
+    "clean": "rm -rf dist/ frontend/build/ backend/redactify-server"
+  },
+  "build": {
+    "appId": "com.redactify.app",
+    "productName": "Redactify",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "frontend/build/**/*",
+      "backend/redactify-server*",
+      "backend/scripts/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/scripts",
+        "to": "backend/scripts"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "frontend/public/icon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "frontend/public/icon.icns"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "frontend/public/icon.png"
+    }
+  },
+  "keywords": [
+    "pii",
+    "redaction",
+    "azure",
+    "ai",
+    "privacy",
+    "gdpr",
+    "desktop"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^7.6.0",
+    "electron": "^22.0.0",
+    "electron-builder": "^24.0.0",
+    "wait-on": "^7.0.1"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^4.18.2"
+  }
+}
