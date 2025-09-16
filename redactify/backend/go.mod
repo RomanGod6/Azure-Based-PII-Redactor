@@ -8,6 +8,7 @@ require (
 	github.com/joho/godotenv v1.4.0
 	github.com/mattn/go-sqlite3 v1.14.17
 	github.com/sirupsen/logrus v1.9.3
+	github.com/tealeg/xlsx/v3 v3.3.13
 )
 
 require (
@@ -35,7 +36,6 @@ require (
 	github.com/rogpeppe/fastuuid v1.2.0 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
 	github.com/shabbyrobe/xmlwriter v0.0.0-20200208144257-9fca06d00ffa // indirect
-	github.com/tealeg/xlsx/v3 v3.3.13 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.2.11 // indirect
 	golang.org/x/arch v0.3.0 // indirect

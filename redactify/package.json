@@ -6,10 +6,10 @@
   "homepage": "./",
   "scripts": {
     "start": "electron .",
-    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\" \"wait-on --timeout 60000 --interval 2000 http://localhost:3000 http://localhost:8080/health && electron . --no-sandbox\"",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\" \"wait-on --timeout 60000 --interval 2000 http://127.0.0.1:3000 http://127.0.0.1:8080/health && electron . --no-sandbox\"",
     "dev:frontend": "cd frontend && npm start",
     "dev:backend": "cd backend && go run cmd/server/main.go",
-    "dev:electron-only": "wait-on http://localhost:3000 http://localhost:8080/health && electron . --no-sandbox",
+    "dev:electron-only": "wait-on http://127.0.0.1:3000 http://127.0.0.1:8080/health && electron . --no-sandbox",
     "build": "npm run build:frontend && npm run build:backend",
     "build:frontend": "cd frontend && npm run build",
     "build:backend": "cd backend && go build -o ../dist/redactify-server cmd/server/main.go",
