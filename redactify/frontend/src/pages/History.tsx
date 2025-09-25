@@ -8,6 +8,11 @@ interface HistoryItem {
   status?: string;
   entities_found?: number;
   processing_time?: string;
+  result_id?: string;
+  session_id?: string;
+  fallback_result_id?: string;
+  fallback_session_id?: string;
+  has_results?: boolean;
 }
 
 interface HistoryData {
@@ -22,6 +27,7 @@ export const History: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [limit, setLimit] = useState(20);
+  const [downloading, setDownloading] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchHistory = async () => {
@@ -41,6 +47,49 @@ export const History: React.FC = () => {
 
     fetchHistory();
   }, [limit]);
+
+  const handleDownloadResults = async (item: HistoryItem, format: 'csv' | 'json' = 'csv') => {
+    try {
+      setDownloading(item.id || '');
+      
+      let response: Response;
+      
+      // Check if we have session_id (new incremental system) or need to use legacy result_id
+      const sessionId = item.session_id || item.fallback_session_id;
+      const resultId = item.result_id || item.fallback_result_id;
+      
+      if (sessionId) {
+        // New system: stream from processing_rows table
+        response = await fetch(`http://localhost:8080/api/v1/files/stream/${sessionId}?format=${format}`);
+      } else if (resultId) {
+        // Legacy system: download from processing_results table
+        response = await fetch(`http://localhost:8080/api/v1/files/legacy/${resultId}?format=${format}`);
+      } else {
+        alert('No results available for this item');
+        return;
+      }
+      
+      if (!response.ok) {
+        throw new Error('Failed to download results');
+      }
+
+      // Download as file
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${item.filename || 'results'}_processed.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      console.error('Download error:', err);
+      alert('Failed to download results: ' + (err instanceof Error ? err.message : 'Unknown error'));
+    } finally {
+      setDownloading(null);
+    }
+  };
 
   if (loading) {
     return (
@@ -172,9 +221,38 @@ export const History: React.FC = () => {
                     }`}>
                       {item.status || 'Complete'}
                     </span>
-                    <button className="text-blue-600 hover:text-blue-800 text-sm font-medium">
-                      View Details
-                    </button>
+                    {item.has_results ? (
+                      <div className="flex space-x-2">
+                        <button 
+                          onClick={() => {
+                            if (item.session_id) {
+                              navigate(`/results/session/${item.session_id}`);
+                            } else if (item.result_id) {
+                              navigate(`/results/${item.result_id}`);
+                            }
+                          }}
+                          className="text-purple-600 hover:text-purple-800 text-sm font-medium"
+                        >
+                          👁️ View Details
+                        </button>
+                        <button 
+                          onClick={() => handleDownloadResults(item, 'csv')}
+                          disabled={downloading === item.id}
+                          className="text-blue-600 hover:text-blue-800 text-sm font-medium disabled:text-gray-400"
+                        >
+                          {downloading === item.id ? '⬇️ Downloading...' : '📥 Download CSV'}
+                        </button>
+                        <button 
+                          onClick={() => handleDownloadResults(item, 'json')}
+                          disabled={downloading === item.id}
+                          className="text-green-600 hover:text-green-800 text-sm font-medium disabled:text-gray-400"
+                        >
+                          📋 JSON
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="text-gray-400 text-sm">No results available</span>
+                    )}
                   </div>
                 </div>
               ))}

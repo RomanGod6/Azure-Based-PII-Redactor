@@ -6,6 +6,7 @@ import { FileProcessor } from './pages/FileProcessor';
 import { Analytics } from './pages/Analytics';
 import { Settings } from './pages/Settings';
 import { History } from './pages/History';
+import { ResultsViewer } from './pages/ResultsViewer';
 
 function App() {
   return (
@@ -17,6 +18,8 @@ function App() {
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/history" element={<History />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="/results/:resultId" element={<ResultsViewer />} />
+          <Route path="/results/session/:sessionId" element={<ResultsViewer />} />
         </Routes>
       </Layout>
     </Router>

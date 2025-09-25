@@ -3,12 +3,19 @@ package db
 import (
 	"database/sql"
 	"fmt"
-	
-	_ "github.com/mattn/go-sqlite3"
+	"os"
+
+	_ "github.com/lib/pq"
+	"github.com/sirupsen/logrus"
 )
 
-func Init(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", dbPath)
+func Init(dbURL string) (*sql.DB, error) {
+	// If dbURL is empty, use environment variables or defaults
+	if dbURL == "" {
+		dbURL = getDefaultPostgresURL()
+	}
+
+	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -24,11 +31,30 @@ func Init(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
+func getDefaultPostgresURL() string {
+	host := getEnvOrDefault("DB_HOST", "localhost")
+	port := getEnvOrDefault("DB_PORT", "5432")
+	user := getEnvOrDefault("DB_USER", "redactify")
+	password := getEnvOrDefault("DB_PASSWORD", "redactify_dev_password")
+	dbname := getEnvOrDefault("DB_NAME", "redactify")
+	sslmode := getEnvOrDefault("DB_SSLMODE", "disable")
+
+	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		host, port, user, password, dbname, sslmode)
+}
+
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
 func createTables(db *sql.DB) error {
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS redaction_history (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+			id SERIAL PRIMARY KEY,
+			timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			filename TEXT,
 			original_text TEXT,
 			redacted_text TEXT,
@@ -37,52 +63,109 @@ func createTables(db *sql.DB) error {
 			processing_time_ms INTEGER,
 			status TEXT DEFAULT 'completed'
 		)`,
-		
+
 		`CREATE TABLE IF NOT EXISTS file_processing (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id SERIAL PRIMARY KEY,
 			filename TEXT NOT NULL,
 			file_size INTEGER,
 			status TEXT DEFAULT 'pending',
 			progress REAL DEFAULT 0.0,
 			rows_processed INTEGER DEFAULT 0,
 			entities_detected INTEGER DEFAULT 0,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			completed_at DATETIME
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			completed_at TIMESTAMP
 		)`,
-		
+
 		`CREATE TABLE IF NOT EXISTS processing_history (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id SERIAL PRIMARY KEY,
 			filename TEXT NOT NULL,
-			timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+			timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			status TEXT DEFAULT 'completed',
 			entities_found INTEGER DEFAULT 0,
 			processing_time_ms REAL DEFAULT 0.0,
 			file_size INTEGER DEFAULT 0,
-			success_rate REAL DEFAULT 100.0
+			success_rate REAL DEFAULT 100.0,
+			result_id TEXT,
+			session_id TEXT
 		)`,
-		
+
 		`CREATE TABLE IF NOT EXISTS app_config (
 			key TEXT PRIMARY KEY,
 			value TEXT,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
-		
+
 		`CREATE TABLE IF NOT EXISTS training_feedback (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id SERIAL PRIMARY KEY,
 			entity_text TEXT NOT NULL,
 			entity_type TEXT NOT NULL,
 			original_score REAL DEFAULT 0.0,
 			user_decision TEXT NOT NULL,
 			user_confidence REAL DEFAULT 1.0,
 			context TEXT,
-			timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+			timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			session_id TEXT
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS processing_results (
+			id TEXT PRIMARY KEY,
+			filename TEXT NOT NULL,
+			original_text TEXT,
+			redacted_text TEXT,
+			entities_found INTEGER DEFAULT 0,
+			processing_time_ms REAL DEFAULT 0.0,
+			rows_processed INTEGER DEFAULT 0,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS processing_rows (
+			id SERIAL PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			row_number INTEGER NOT NULL,
+			original_text TEXT,
+			redacted_text TEXT,
+			entities_count INTEGER DEFAULT 0,
+			processing_time_ms REAL DEFAULT 0.0,
+			status TEXT DEFAULT 'completed',
+			error_message TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(session_id, row_number)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS detected_entities (
+			id SERIAL PRIMARY KEY,
+			session_id TEXT,
+			result_id TEXT,
+			entity_type TEXT NOT NULL,
+			entity_text TEXT NOT NULL,
+			start_position INTEGER,
+			end_position INTEGER,
+			confidence REAL,
+			category TEXT,
+			row_number INTEGER,
+			approved BOOLEAN DEFAULT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
 	}
 
 	for _, query := range queries {
 		if _, err := db.Exec(query); err != nil {
 			return fmt.Errorf("failed to execute query: %w", err)
+		}
+	}
+
+	// Add migrations for existing tables
+	migrations := []string{
+		// Add result_id and session_id columns to processing_history if they don't exist
+		`ALTER TABLE processing_history ADD COLUMN IF NOT EXISTS result_id TEXT`,
+		`ALTER TABLE processing_history ADD COLUMN IF NOT EXISTS session_id TEXT`,
+	}
+
+	for _, migration := range migrations {
+		_, err := db.Exec(migration)
+		if err != nil {
+			logrus.WithError(err).Warnf("Migration failed (may already exist): %s", migration)
+			// Don't return error as columns might already exist
 		}
 	}
 

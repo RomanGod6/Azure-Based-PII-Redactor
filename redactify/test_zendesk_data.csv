@@ -1,6 +1,0 @@
-ticket_id,customer_name,email,phone,subject,description,created_date,status
-12345,John Smith,john.smith@gmail.com,555-123-4567,Login Issues,"Customer is unable to login to their account. They tried resetting password but didn't receive email at john.smith@gmail.com",2024-03-15 10:30:00,Open
-12346,Sarah Johnson,s.johnson@acmecorp.com,555-987-6543,Billing Question,"Question about charge on credit card 4532-1234-5678-9012. Customer Sarah Johnson wants refund processed to her account.",2024-03-15 11:45:00,Pending
-12347,Michael Chen,mchen2024@yahoo.com,555-555-0199,Feature Request,"User Michael Chen (SSN: 123-45-6789) requesting new dashboard features. Contact at mchen2024@yahoo.com for updates.",2024-03-15 14:20:00,In Progress
-12348,Lisa Rodriguez,lisa.r@techstartup.io,555-444-3322,Account Deletion,"Please delete my account and all personal data including phone 555-444-3322 and address 123 Main St, Boston MA 02101",2024-03-16 09:15:00,Open
-12349,David Kim,david.kim.work@enterprise.com,555-111-2233,Integration Help Login Issues,"Need help setting up API integration. My employee ID is EMP-9876 and IP whitelist should include 192.168.1.100",2024-03-16 16:30:00,Resolved

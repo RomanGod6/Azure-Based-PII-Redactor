@@ -17,7 +17,17 @@ install: ## Install all dependencies (Node.js, Go)
 
 dev: ## Start development environment
 	@echo "Starting development environment..."
-	npm run dev
+	@echo "Starting PostgreSQL..."
+	docker-compose up -d postgres
+	@echo "Waiting for PostgreSQL to be ready..."
+	npx wait-on tcp:5432
+	npx concurrently "make dev-backend" "make dev-frontend" "wait-on --timeout 60000 --interval 2000 http://127.0.0.1:3000 http://127.0.0.1:8080/health && electron ."
+
+dev-frontend: ## Start frontend development server
+	cd frontend && npm start
+
+dev-backend: ## Start backend development server
+	cd backend && go mod tidy && DB_HOST=127.0.0.1 go run cmd/server/main.go
 
 # Building
 build-dev: ## Build for development
@@ -78,11 +88,8 @@ clean: ## Clean build artifacts
 	rm -rf dist/
 
 # Development utilities
-dev-frontend: ## Start frontend development server only
-	cd frontend && npm start
 
-dev-backend: ## Start backend development server only
-	cd backend && go run cmd/server/main.go
+
 
 # Production deployment
 package-win: ## Package for Windows

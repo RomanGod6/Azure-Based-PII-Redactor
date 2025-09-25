@@ -22,7 +22,7 @@ func main() {
 	cfg := config.New()
 
 	// Initialize database
-	database, err := db.Init(cfg.Database.Path)
+	database, err := db.Init(cfg.Database.URL)
 	if err != nil {
 		log.Fatal("Failed to initialize database:", err)
 	}

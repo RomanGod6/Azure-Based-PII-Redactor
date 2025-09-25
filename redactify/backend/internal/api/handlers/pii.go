@@ -14,8 +14,8 @@ import (
 )
 
 type PIIHandler struct {
-	db     *sql.DB
-	config *config.Config
+	db       *sql.DB
+	config   *config.Config
 	detector *pii.Detector
 }
 
@@ -31,20 +31,20 @@ type DetectResponse struct {
 }
 
 type RedactRequest struct {
-	Text     string            `json:"text" binding:"required"`
-	Options  *pii.RedactOptions `json:"options,omitempty"`
+	Text    string             `json:"text" binding:"required"`
+	Options *pii.RedactOptions `json:"options,omitempty"`
 }
 
 type RedactResponse struct {
-	OriginalText string       `json:"original_text"`
-	RedactedText string       `json:"redacted_text"`
-	Entities     []pii.Entity `json:"entities"`
-	RedactedCount int         `json:"redacted_count"`
-	ProcessTime  string       `json:"process_time"`
+	OriginalText  string       `json:"original_text"`
+	RedactedText  string       `json:"redacted_text"`
+	Entities      []pii.Entity `json:"entities"`
+	RedactedCount int          `json:"redacted_count"`
+	ProcessTime   string       `json:"process_time"`
 }
 
 type BatchProcessRequest struct {
-	Items   []string          `json:"items" binding:"required"`
+	Items   []string           `json:"items" binding:"required"`
 	Options *pii.RedactOptions `json:"options,omitempty"`
 }
 
@@ -56,8 +56,8 @@ type BatchProcessResponse struct {
 }
 
 type BatchSummary struct {
-	TotalEntities    int     `json:"total_entities"`
-	TotalRedacted    int     `json:"total_redacted"`
+	TotalEntities     int     `json:"total_entities"`
+	TotalRedacted     int     `json:"total_redacted"`
 	AverageConfidence float64 `json:"average_confidence"`
 }
 
@@ -114,7 +114,7 @@ func (h *PIIHandler) RedactPII(c *gin.Context) {
 	}
 
 	processTime := getProcessTime(startTime)
-	
+
 	response := RedactResponse{
 		OriginalText:  req.Text,
 		RedactedText:  result.RedactedText,
@@ -212,12 +212,12 @@ func (h *PIIHandler) GetHistory(c *gin.Context) {
 
 	// Get history records
 	query := `
-		SELECT id, filename, timestamp, status, entities_found, processing_time_ms 
+		SELECT id, filename, timestamp, status, entities_found, processing_time_ms, result_id, session_id 
 		FROM processing_history 
 		ORDER BY timestamp DESC 
-		LIMIT ?
+		LIMIT $1
 	`
-	
+
 	rows, err := h.db.Query(query, limit)
 	if err != nil {
 		logrus.WithError(err).Error("Failed to query processing history")
@@ -229,26 +229,56 @@ func (h *PIIHandler) GetHistory(c *gin.Context) {
 	var history []interface{}
 	for rows.Next() {
 		var id, filename, status string
+		var resultID, sessionID sql.NullString
 		var timestamp time.Time
 		var entitiesFound int
 		var processingTimeMs float64
 
-		err := rows.Scan(&id, &filename, &timestamp, &status, &entitiesFound, &processingTimeMs)
+		err := rows.Scan(&id, &filename, &timestamp, &status, &entitiesFound, &processingTimeMs, &resultID, &sessionID)
 		if err != nil {
 			logrus.WithError(err).Warn("Failed to scan history row")
 			continue
 		}
 
 		processingTime := fmt.Sprintf("%.1fms", processingTimeMs)
-		
-		history = append(history, gin.H{
-			"id":              id,
-			"filename":        filename,
-			"timestamp":       timestamp.Format("2006-01-02 15:04:05"),
-			"status":          status,
-			"entities_found":  entitiesFound,
-			"processing_time": processingTime,
-		})
+
+		// Check if we have results - either via result_id/session_id or by filename fallback
+		hasResults := resultID.Valid && resultID.String != ""
+		fallbackResultID := ""
+		fallbackSessionID := ""
+
+		// If no direct link, try to find results by filename and approximate timestamp
+		if !hasResults && filename != "" {
+			var foundResultID, foundSessionID sql.NullString
+			fallbackQuery := `
+				SELECT id, session_id FROM processing_results 
+				WHERE filename = $1 
+				ORDER BY created_at DESC 
+				LIMIT 1
+			`
+			err := h.db.QueryRow(fallbackQuery, filename).Scan(&foundResultID, &foundSessionID)
+			if err == nil && foundResultID.Valid {
+				hasResults = true
+				fallbackResultID = foundResultID.String
+				fallbackSessionID = foundSessionID.String
+			}
+		}
+
+		historyItem := gin.H{
+			"id":                  id,
+			"filename":            filename,
+			"timestamp":           timestamp.Format("2006-01-02 15:04:05"),
+			"status":              status,
+			"entities_found":      entitiesFound,
+			"processing_time":     processingTime,
+			"result_id":           resultID.String,
+			"session_id":          sessionID.String,
+			"fallback_result_id":  fallbackResultID,
+			"fallback_session_id": fallbackSessionID,
+			"has_results":         hasResults,
+		}
+
+		history = append(history, historyItem)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -306,7 +336,7 @@ func (h *PIIHandler) GetAnalytics(c *gin.Context) {
 func (h *PIIHandler) GetConfig(c *gin.Context) {
 	azureConfigured := h.config.Azure.Endpoint != "" && h.config.Azure.APIKey != ""
 	gptConfigured := h.config.Azure.GPTEndpoint != "" && h.config.Azure.GPTAPIKey != ""
-	
+
 	// Test Azure connectivity
 	azureOnline := false
 	if azureConfigured {
@@ -314,8 +344,8 @@ func (h *PIIHandler) GetConfig(c *gin.Context) {
 		_, err := azureClient.DetectPII("test")
 		azureOnline = err == nil
 	}
-	
-	// Test GPT connectivity  
+
+	// Test GPT connectivity
 	gptOnline := false
 	if gptConfigured {
 		gptValidator := pii.NewGPTValidator(h.config)
@@ -324,7 +354,7 @@ func (h *PIIHandler) GetConfig(c *gin.Context) {
 			gptOnline = true // We'll assume it's online if configured
 		}
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{
 		"go_backend":       true,
 		"azure_configured": azureConfigured,
@@ -374,12 +404,12 @@ func (h *PIIHandler) GetTrainingStats(c *gin.Context) {
 
 	// Get confidence engine stats
 	stats := h.detector.GetConfidenceEngine().GetStats()
-	
+
 	c.JSON(http.StatusOK, gin.H{
-		"total_feedback":     totalFeedback,
-		"entity_types":       entityTypes,
-		"confidence_stats":   stats,
-		"has_training_data":  totalFeedback > 0,
+		"total_feedback":    totalFeedback,
+		"entity_types":      entityTypes,
+		"confidence_stats":  stats,
+		"has_training_data": totalFeedback > 0,
 	})
 }
 
@@ -416,10 +446,10 @@ func (h *PIIHandler) SubmitFeedback(c *gin.Context) {
 func (h *PIIHandler) saveFeedbackToDatabase(feedback pii.FeedbackRecord) {
 	query := `
 		INSERT INTO training_feedback (entity_text, entity_type, original_score, user_decision, user_confidence, context, timestamp, session_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
-	
-	_, err := h.db.Exec(query, 
+
+	_, err := h.db.Exec(query,
 		feedback.EntityText,
 		feedback.EntityType,
 		feedback.OriginalScore,
@@ -429,7 +459,7 @@ func (h *PIIHandler) saveFeedbackToDatabase(feedback pii.FeedbackRecord) {
 		feedback.Timestamp,
 		feedback.SessionID,
 	)
-	
+
 	if err != nil {
 		logrus.WithError(err).Error("Failed to save training feedback to database")
 	}
@@ -440,12 +470,12 @@ func (h *PIIHandler) saveToHistory(originalText string, result *pii.RedactResult
 	// Save processing result to database
 	query := `
 		INSERT INTO processing_history (filename, entities_found, processing_time_ms, status)
-		VALUES (?, ?, ?, ?)
+		VALUES ($1, $2, $3, $4)
 	`
-	
+
 	// Extract processing time from result if available, otherwise use 0
 	processingTimeMs := 0.0
-	
+
 	_, err := h.db.Exec(query, "text_processing", len(result.Entities), processingTimeMs, "completed")
 	if err != nil {
 		logrus.WithError(err).Error("Failed to save processing result to history")
@@ -456,7 +486,7 @@ func calculateAverageConfidence(entities []pii.Entity) float64 {
 	if len(entities) == 0 {
 		return 0.0
 	}
-	
+
 	total := 0.0
 	for _, entity := range entities {
 		total += entity.Confidence

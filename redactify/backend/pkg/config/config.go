@@ -25,7 +25,7 @@ type AzureConfig struct {
 }
 
 type DatabaseConfig struct {
-	Path string
+	URL string
 }
 
 func New() *Config {
@@ -44,7 +44,7 @@ func New() *Config {
 			GPTAPIVersion: getEnv("AZURE_GPT_API_VERSION", "2024-08-01-preview"),
 		},
 		Database: DatabaseConfig{
-			Path: getEnv("DATABASE_PATH", "./redactify.db"),
+			URL: getEnv("DATABASE_URL", ""),
 		},
 	}
 }

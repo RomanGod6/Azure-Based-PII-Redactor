@@ -1,5 +1,6 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { FeedbackTrainer } from '../components/FeedbackTrainer';
+import { fileProcessingWebSocket } from '../services/websocket';
 
 interface ProcessingOptions {
   redactionMode: 'replace' | 'mask' | 'remove';
@@ -21,9 +22,12 @@ interface DetectedEntity {
 interface ProcessingResult {
   original_text: string;
   redacted_text: string;
-  entities: DetectedEntity[];
+  entities?: DetectedEntity[];
   redacted_count: number;
   process_time: string;
+  rows_processed?: number;
+  file_name?: string;
+  result_id?: string;
 }
 
 export const FileProcessor: React.FC = () => {
@@ -48,11 +52,12 @@ export const FileProcessor: React.FC = () => {
   
   // Filtering and pagination state
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedEntityTypes, setSelectedEntityTypes] = useState<Set<string>>(new Set());
+  const [selectedEntityTypes, setSelectedEntityTypes] = useState<Set<string>>(new Set<string>());
   const [confidenceThreshold, setConfidenceThreshold] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
-  const [itemsPerPage] = useState(50);
+  const [itemsPerPage, setItemsPerPage] = useState(50);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const entitiesBufferRef = useRef<DetectedEntity[]>([]);
 
   // Fetch training statistics when component mounts or step changes to options
   useEffect(() => {
@@ -107,17 +112,17 @@ export const FileProcessor: React.FC = () => {
 
   const processFile = async () => {
     if (!file && !textInput) return;
-    
+
     setStep('processing');
     setProgress(0);
     setProgressMessage('Initializing...');
+    entitiesBufferRef.current = [];
+    setEntities([]);
 
     try {
-      let response;
-      
       if (processingMode === 'text') {
-        // Process text directly
-        response = await fetch('http://localhost:8080/api/v1/pii/redact', {
+        // Process text directly using existing API
+        const response = await fetch('http://localhost:8080/api/v1/pii/redact', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -132,100 +137,179 @@ export const FileProcessor: React.FC = () => {
             }
           }),
         });
-      } else {
-        // Process file with SSE progress updates
-        console.log('🚀 Frontend: Processing file with progress updates', {
-          fileName: file!.name,
-          fileSize: file!.size,
-          options: options,
-          optionsJson: JSON.stringify(options)
-        });
-        
-        const formData = new FormData();
-        formData.append('file', file!);
-        formData.append('options', JSON.stringify(options));
-
-        console.log('📤 Frontend: Starting SSE connection to /api/v1/files/process');
-        
-        // Use fetch for SSE connection
-        response = await fetch('http://localhost:8080/api/v1/files/process', {
-          method: 'POST',
-          body: formData,
-        });
 
         if (!response.ok) {
-          throw new Error('Processing failed');
+          throw new Error('Text processing failed');
         }
 
-        // Handle SSE stream
-        const reader = response.body?.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        if (!reader) {
-          throw new Error('No response stream available');
+        const data = await response.json();
+        setResults(data);
+        setOriginalContent(data.original_text || textInput);
+        
+        if (data.entities) {
+          data.entities.forEach((entity: DetectedEntity) => {
+            entity.approved = true;
+          });
+          setEntities(data.entities);
         }
+        
+        setStep('review');
+      } else {
+        // Process file using WebSocket
+        console.log('🚀 Frontend: Processing file with WebSocket', {
+          fileName: file!.name,
+          fileSize: file!.size,
+          options: options
+        });
 
-        while (true) {
-          const { done, value } = await reader.read();
-          
-          if (done) break;
-          
-          buffer += decoder.decode(value, { stream: true });
-          
-          // Process complete SSE messages
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || ''; // Keep incomplete line in buffer
-          
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.slice(6)); // Remove 'data: ' prefix
-                console.log('📊 Progress update:', data);
-                
-                // Update progress based on SSE data
-                if (data.total_rows > 0) {
-                  const progressPercent = (data.current_row / data.total_rows) * 100;
-                  setProgress(progressPercent);
-                }
-                
-                // Update status message
-                if (data.message) {
-                  console.log(`🔄 ${data.message}`);
-                  setProgressMessage(data.message);
-                }
-                
-                // Handle completion
-                if (data.is_complete && data.results) {
-                  console.log('✅ Processing completed!', data.results);
-                  setProgress(100);
-                  
-                  setResults(data.results);
-                  setOriginalContent(data.results.original_text || '');
-                  setEntities(data.results.entities.map((entity: DetectedEntity) => ({
-                    ...entity,
-                    approved: true // Default to approved, user can uncheck
-                  })));
-                  setStep('review');
-                  return; // Exit the function
-                }
-                
-                // Handle errors
-                if (data.status === 'error') {
-                  throw new Error(data.message || 'Processing failed');
-                }
-              } catch (parseError) {
-                console.warn('Failed to parse SSE data:', line, parseError);
-              }
-            }
+        // Convert file to base64 for WebSocket transmission
+        const fileContent = await fileToBase64(file!);
+        
+        // Set up WebSocket handlers
+        fileProcessingWebSocket.setProgressHandler((progressData: any) => {
+          console.log('📊 Progress update:', progressData);
+
+          // Update entities buffer
+          if (Array.isArray(progressData.entities) && progressData.entities.length > 0) {
+            const chunk = progressData.entities as DetectedEntity[];
+            chunk.forEach((entity) => {
+              entity.approved = true;
+            });
+            entitiesBufferRef.current.push(...chunk);
           }
-        }
+
+          // Update progress
+          if (progressData.total_rows > 0) {
+            const progressPercent = Math.min(100, (progressData.current_row / progressData.total_rows) * 100);
+            setProgress(progressPercent);
+          }
+          
+          // Update status message
+          if (progressData.message) {
+            console.log(`🔄 ${progressData.message}`);
+            setProgressMessage(progressData.message);
+          }
+        });
+
+        fileProcessingWebSocket.setCompleteHandler(async (resultData: any) => {
+          console.log('✅ Processing completed!', resultData);
+          setProgress(100);
+
+          const parsedResults = resultData as ProcessingResult;
+          
+          // Check if we have a result_id (lightweight response)
+          if (parsedResults.result_id && (!parsedResults.original_text || !parsedResults.redacted_text)) {
+            console.log('📥 Fetching full results from backend...', parsedResults.result_id);
+            
+            try {
+              // Fetch full results from backend
+              const response = await fetch(`http://localhost:8080/api/v1/files/results/${parsedResults.result_id}`);
+              if (!response.ok) {
+                throw new Error(`Failed to fetch results: ${response.statusText}`);
+              }
+              
+              const fullResults = await response.json();
+              console.log('📋 Full results retrieved', { 
+                id: fullResults.id, 
+                filename: fullResults.filename,
+                content_size: fullResults.original_text?.length || 0,
+                entities_found: fullResults.entities_found 
+              });
+              
+              // Use full results but keep the lightweight metadata
+              const cleanedResults: ProcessingResult = {
+                ...parsedResults,
+                original_text: fullResults.original_text,
+                redacted_text: fullResults.redacted_text,
+                entities: undefined,
+              };
+              
+              setResults(cleanedResults);
+              setOriginalContent(fullResults.original_text || '');
+              
+            } catch (error) {
+              console.error('❌ Failed to fetch full results:', error);
+              alert('Processing completed but failed to retrieve full results. Please try again.');
+              setStep('options');
+              return;
+            }
+          } else {
+            // Legacy response with full content
+            const cleanedResults: ProcessingResult = {
+              ...parsedResults,
+              entities: undefined,
+            };
+            setResults(cleanedResults);
+            setOriginalContent(cleanedResults.original_text || '');
+          }
+
+          // Set final entities
+          const finalEntities = [...entitiesBufferRef.current];
+          setEntities(finalEntities);
+          entitiesBufferRef.current = [];
+          setSearchQuery('');
+          setSelectedEntityTypes(new Set<string>());
+          setConfidenceThreshold(0);
+          setCurrentPage(1);
+          setStep('review');
+        });
+
+        fileProcessingWebSocket.setErrorHandler((error: any) => {
+          console.error('❌ Processing error:', error);
+          alert(`Processing failed: ${error.message || 'Unknown error'}`);
+          setStep('options');
+        });
+
+        fileProcessingWebSocket.setRateLimitHandler((rateLimitInfo: any) => {
+          console.warn('⚠️ Rate limit hit:', rateLimitInfo);
+          setProgressMessage(`Rate limit reached. Retrying in ${rateLimitInfo.retry_after}s...`);
+        });
+
+        // Start WebSocket processing
+        await fileProcessingWebSocket.processFile(
+          file!.name,
+          fileContent,
+          file!.type,
+          {
+            redaction_mode: options.redactionMode,
+            custom_labels: options.customLabels,
+            preserve_cases: false,
+            use_training: options.useTraining,
+            detection_mode: options.detectionMode
+          }
+        );
       }
     } catch (error) {
       console.error('Processing error:', error);
       alert('Processing failed. Please try again.');
       setStep('options');
     }
+  };
+
+  // Helper function to convert file to base64
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          // Remove data URL prefix (data:mime/type;base64,)
+          const base64 = reader.result.split(',')[1];
+          resolve(base64);
+        } else {
+          reject(new Error('Failed to convert file to base64'));
+        }
+      };
+      reader.onerror = error => reject(error);
+    });
+  };
+
+  // Cancel processing function
+  const cancelProcessing = () => {
+    fileProcessingWebSocket.cancel();
+    setProgress(0);
+    setProgressMessage('Processing cancelled');
+    setStep('options');
   };
 
   const toggleEntityApproval = (index: number) => {
@@ -278,7 +362,7 @@ export const FileProcessor: React.FC = () => {
     const report = {
       original_filename: file?.name || 'text_input',
       processing_time: results.process_time,
-      total_entities_found: results.entities.length,
+      total_entities_found: entities.length,
       entities_redacted: approvedEntities.length,
       redaction_mode: options.redactionMode,
       detection_mode: options.detectionMode,
@@ -299,74 +383,134 @@ export const FileProcessor: React.FC = () => {
   };
 
   // Filter and pagination logic
-  const filteredEntities = entities.filter(entity => {
-    // Search filter
-    if (searchQuery && !entity.text.toLowerCase().includes(searchQuery.toLowerCase())) {
-      return false;
-    }
-    
-    // Entity type filter
-    if (selectedEntityTypes.size > 0 && !selectedEntityTypes.has(entity.type)) {
-      return false;
-    }
-    
-    // Confidence filter
-    if (entity.confidence < confidenceThreshold / 100) {
-      return false;
-    }
-    
-    return true;
-  });
+  const filteredEntities = useMemo(() => {
+    const normalizedQuery = searchQuery.trim().toLowerCase();
+
+    return entities.filter(entity => {
+      if (normalizedQuery && !entity.text.toLowerCase().includes(normalizedQuery)) {
+        return false;
+      }
+
+      if (selectedEntityTypes.size > 0 && !selectedEntityTypes.has(entity.type)) {
+        return false;
+      }
+
+      if (entity.confidence < confidenceThreshold / 100) {
+        return false;
+      }
+
+      return true;
+    });
+  }, [entities, searchQuery, selectedEntityTypes, confidenceThreshold]);
 
   const totalPages = Math.ceil(filteredEntities.length / itemsPerPage);
-  const paginatedEntities = filteredEntities.slice(
-    (currentPage - 1) * itemsPerPage,
-    currentPage * itemsPerPage
-  );
 
-  // Get unique entity types with counts and average confidence
-  const entityTypeStats = entities.reduce((acc, entity) => {
-    if (!acc[entity.type]) {
-      acc[entity.type] = { count: 0, totalConfidence: 0, entities: [] };
+  const paginatedEntities = useMemo(() => {
+    const startIndex = (currentPage - 1) * itemsPerPage;
+    return filteredEntities.slice(startIndex, startIndex + itemsPerPage);
+  }, [filteredEntities, currentPage, itemsPerPage]);
+
+  const entityTypes = useMemo(() => {
+    const stats = new Map<string, { count: number; totalConfidence: number }>();
+
+    entities.forEach(entity => {
+      const record = stats.get(entity.type);
+      if (record) {
+        record.count += 1;
+        record.totalConfidence += entity.confidence;
+      } else {
+        stats.set(entity.type, { count: 1, totalConfidence: entity.confidence });
+      }
+    });
+
+    return Array.from(stats.entries())
+      .map(([type, data]) => ({
+        type,
+        count: data.count,
+        avgConfidence: Math.round((data.totalConfidence / data.count) * 100)
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [entities]);
+
+  const visiblePages = useMemo(() => {
+    if (totalPages <= 7) {
+      return Array.from({ length: totalPages }, (_, index) => index + 1);
     }
-    acc[entity.type].count++;
-    acc[entity.type].totalConfidence += entity.confidence;
-    acc[entity.type].entities.push(entity);
-    return acc;
-  }, {} as Record<string, { count: number; totalConfidence: number; entities: typeof entities }>);
 
-  const entityTypes = Object.entries(entityTypeStats).map(([type, stats]) => ({
-    type,
-    count: stats.count,
-    avgConfidence: Math.round((stats.totalConfidence / stats.count) * 100),
-    entities: stats.entities
-  })).sort((a, b) => b.count - a.count);
+    const pages = new Set<number>([1, totalPages]);
+    for (let offset = -2; offset <= 2; offset++) {
+      const page = currentPage + offset;
+      if (page > 1 && page < totalPages) {
+        pages.add(page);
+      }
+    }
+
+    return Array.from(pages).sort((a, b) => a - b);
+  }, [totalPages, currentPage]);
+
+  const entityIndexMap = useMemo(() => {
+    const map = new Map<DetectedEntity, number>();
+    entities.forEach((entity, index) => {
+      map.set(entity, index);
+    });
+    return map;
+  }, [entities]);
+
+  const safeTotalPages = Math.max(totalPages, 1);
+  const safeCurrentPage = Math.min(currentPage, safeTotalPages);
+  const pageStart = filteredEntities.length === 0
+    ? 0
+    : (safeCurrentPage - 1) * itemsPerPage + 1;
+  const pageEnd = filteredEntities.length === 0
+    ? 0
+    : Math.min(safeCurrentPage * itemsPerPage, filteredEntities.length);
+  const isOnFirstPage = filteredEntities.length === 0 || safeCurrentPage <= 1;
+  const isOnLastPage = filteredEntities.length === 0 || safeCurrentPage >= safeTotalPages;
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchQuery, confidenceThreshold, selectedEntityTypes, itemsPerPage]);
+
+  useEffect(() => {
+    if (totalPages === 0) {
+      if (currentPage !== 1) {
+        setCurrentPage(1);
+      }
+      return;
+    }
+
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
 
   // Bulk actions
   const toggleEntityType = (type: string) => {
-    const newSelected = new Set(selectedEntityTypes);
-    if (newSelected.has(type)) {
-      newSelected.delete(type);
-    } else {
-      newSelected.add(type);
-    }
-    setSelectedEntityTypes(newSelected);
-    setCurrentPage(1); // Reset to first page when filtering
+    setSelectedEntityTypes(prev => {
+      const next = new Set(prev);
+      if (next.has(type)) {
+        next.delete(type);
+      } else {
+        next.add(type);
+      }
+      return next;
+    });
   };
 
   const bulkSkipEntityType = (type: string) => {
-    const typeEntities = entityTypeStats[type]?.entities || [];
-    const updatedEntities = entities.map(entity => 
-      entity.type === type ? { ...entity, approved: false } : entity
+    setEntities(prev =>
+      prev.map(entity =>
+        entity.type === type ? { ...entity, approved: false } : entity
+      )
     );
-    setEntities(updatedEntities);
   };
 
   const bulkIncludeEntityType = (type: string) => {
-    const updatedEntities = entities.map(entity => 
-      entity.type === type ? { ...entity, approved: true } : entity
+    setEntities(prev =>
+      prev.map(entity =>
+        entity.type === type ? { ...entity, approved: true } : entity
+      )
     );
-    setEntities(updatedEntities);
   };
 
   const resetProcessor = () => {
@@ -374,12 +518,13 @@ export const FileProcessor: React.FC = () => {
     setTextInput('');
     setResults(null);
     setEntities([]);
+    entitiesBufferRef.current = [];
     setStep('upload');
     setProgress(0);
     setProgressMessage('');
     // Reset filters
     setSearchQuery('');
-    setSelectedEntityTypes(new Set());
+    setSelectedEntityTypes(new Set<string>());
     setConfidenceThreshold(0);
     setCurrentPage(1);
   };
@@ -690,7 +835,15 @@ export const FileProcessor: React.FC = () => {
                 style={{ width: `${progress}%` }}
               ></div>
             </div>
-            <p className="text-sm text-gray-500">{Math.round(progress)}% complete</p>
+            <p className="text-sm text-gray-500 mb-4">{Math.round(progress)}% complete</p>
+            
+            {/* Cancel Button */}
+            <button
+              onClick={cancelProcessing}
+              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
+            >
+              Cancel Processing
+            </button>
           </div>
         </div>
       )}
@@ -702,7 +855,7 @@ export const FileProcessor: React.FC = () => {
             <h3 className="text-lg font-semibold text-gray-900 mb-4">Processing Results</h3>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="text-center p-4 bg-blue-50 rounded-lg">
-                <div className="text-2xl font-bold text-blue-600">{results.entities.length}</div>
+                <div className="text-2xl font-bold text-blue-600">{entities.length}</div>
                 <div className="text-sm text-gray-600">PII Entities Found</div>
               </div>
               <div className="text-center p-4 bg-green-50 rounded-lg">
@@ -815,7 +968,7 @@ export const FileProcessor: React.FC = () => {
                     <button
                       onClick={() => {
                         setSearchQuery('');
-                        setSelectedEntityTypes(new Set());
+                        setSelectedEntityTypes(new Set<string>());
                         setConfidenceThreshold(0);
                       }}
                       className="mt-2 text-blue-600 hover:underline"
@@ -826,8 +979,12 @@ export const FileProcessor: React.FC = () => {
                 ) : (
                   <>
                     <div className="space-y-2 mb-4">
-                      {paginatedEntities.map((entity, index) => {
-                        const globalIndex = entities.findIndex(e => e === entity);
+                      {paginatedEntities.map((entity) => {
+                        const globalIndex = entityIndexMap.get(entity);
+                        if (globalIndex === undefined) {
+                          return null;
+                        }
+
                         return (
                           <div key={globalIndex} className="flex items-center justify-between p-3 border rounded-lg">
                             <div className="flex items-center space-x-3">
@@ -856,57 +1013,68 @@ export const FileProcessor: React.FC = () => {
                     </div>
 
                     {/* Pagination */}
-                    {totalPages > 1 && (
-                      <div className="flex items-center justify-between border-t pt-4">
+                    {filteredEntities.length > 0 && (
+                      <div className="flex flex-col gap-4 border-t pt-4 md:flex-row md:items-center md:justify-between">
                         <div className="text-sm text-gray-600">
-                          Showing {((currentPage - 1) * itemsPerPage) + 1} - {Math.min(currentPage * itemsPerPage, filteredEntities.length)} of {filteredEntities.length} results
+                          Showing {pageStart}-{pageEnd} of {filteredEntities.length} results · Page {safeCurrentPage} of {safeTotalPages}
                         </div>
-                        <div className="flex space-x-2">
-                          <button
-                            onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
-                            disabled={currentPage === 1}
-                            className="px-3 py-1 border rounded text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
-                          >
-                            Previous
-                          </button>
-                          {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
-                            const page = i + 1;
-                            return (
-                              <button
-                                key={page}
-                                onClick={() => setCurrentPage(page)}
-                                className={`px-3 py-1 border rounded text-sm ${
-                                  currentPage === page
-                                    ? 'bg-blue-600 text-white border-blue-600'
-                                    : 'hover:bg-gray-50'
-                                }`}
-                              >
-                                {page}
-                              </button>
-                            );
-                          })}
-                          {totalPages > 5 && (
-                            <>
-                              <span className="px-2">...</span>
-                              <button
-                                onClick={() => setCurrentPage(totalPages)}
-                                className={`px-3 py-1 border rounded text-sm ${
-                                  currentPage === totalPages
-                                    ? 'bg-blue-600 text-white border-blue-600'
-                                    : 'hover:bg-gray-50'
-                                }`}
-                              >
-                                {totalPages}
-                              </button>
-                            </>
-                          )}
-                          <button
-                            onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
-                            disabled={currentPage === totalPages}
-                            className="px-3 py-1 border rounded text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
-                          >
-                            Next
-                          </button>
+                        <div className="flex flex-col gap-3 md:flex-row md:items-center md:gap-4">
+                          <label className="flex items-center space-x-2 text-sm text-gray-600">
+                            <span>Rows per page:</span>
+                            <select
+                              value={itemsPerPage}
+                              onChange={(e) => setItemsPerPage(Number(e.target.value))}
+                              className="rounded border border-gray-300 px-2 py-1 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            >
+                              {[25, 50, 100, 250, 500].map(size => (
+                                <option key={size} value={size}>{size}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <div className="flex items-center space-x-1">
+                            <button
+                              onClick={() => setCurrentPage(1)}
+                              disabled={isOnFirstPage}
+                              className="px-3 py-1 border rounded text-sm disabled:cursor-not-allowed disabled:opacity-50 hover:bg-gray-50"
+                            >
+                              First
+                            </button>
+                            <button
+                              onClick={() => setCurrentPage(Math.max(1, safeCurrentPage - 1))}
+                              disabled={isOnFirstPage}
+                              className="px-3 py-1 border rounded text-sm disabled:cursor-not-allowed disabled:opacity-50 hover:bg-gray-50"
+                            >
+                              Previous
+                            </button>
+                            {visiblePages.map((page, index) => {
+                              const showEllipsis = index > 0 && page - visiblePages[index - 1] > 1;
+                              return (
+                                <React.Fragment key={page}>
+                                  {showEllipsis && <span className="px-1 text-sm text-gray-500">...</span>}
+                                  <button
+                                    onClick={() => setCurrentPage(page)}
+                                    className={`px-3 py-1 border rounded text-sm ${safeCurrentPage === page ? 'bg-blue-600 text-white border-blue-600' : 'hover:bg-gray-50'}`}
+                                  >
+                                    {page}
+                                  </button>
+                                </React.Fragment>
+                              );
+                            })}
+                            <button
+                              onClick={() => setCurrentPage(Math.min(safeTotalPages, safeCurrentPage + 1))}
+                              disabled={isOnLastPage}
+                              className="px-3 py-1 border rounded text-sm disabled:cursor-not-allowed disabled:opacity-50 hover:bg-gray-50"
+                            >
+                              Next
+                            </button>
+                            <button
+                              onClick={() => setCurrentPage(safeTotalPages)}
+                              disabled={isOnLastPage}
+                              className="px-3 py-1 border rounded text-sm disabled:cursor-not-allowed disabled:opacity-50 hover:bg-gray-50"
+                            >
+                              Last
+                            </button>
+                          </div>
                         </div>
                       </div>
                     )}
