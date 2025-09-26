@@ -20,14 +20,14 @@ dev: ## Start development environment
 	@echo "Starting PostgreSQL..."
 	docker-compose up -d postgres
 	@echo "Waiting for PostgreSQL to be ready..."
-	npx wait-on tcp:5432
+	npx wait-on tcp:55432
 	npx concurrently "make dev-backend" "make dev-frontend" "wait-on --timeout 60000 --interval 2000 http://127.0.0.1:3000 http://127.0.0.1:8080/health && electron ."
 
 dev-frontend: ## Start frontend development server
 	cd frontend && npm start
 
 dev-backend: ## Start backend development server
-	cd backend && go mod tidy && DB_HOST=127.0.0.1 go run cmd/server/main.go
+	cd backend && go mod tidy && DB_HOST=127.0.0.1 DB_PORT=55432 go run cmd/server/main.go
 
 # Building
 build-dev: ## Build for development

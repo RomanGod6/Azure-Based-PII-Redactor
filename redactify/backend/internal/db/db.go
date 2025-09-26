@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/sirupsen/logrus"
@@ -20,6 +22,11 @@ func Init(dbURL string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
+	// Configure connection pooling for optimal performance
+	if err := configureConnectionPool(db); err != nil {
+		return nil, fmt.Errorf("failed to configure connection pool: %w", err)
+	}
+
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
@@ -28,7 +35,36 @@ func Init(dbURL string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to create tables: %w", err)
 	}
 
+	logrus.Info("📊 Database initialized with connection pooling")
 	return db, nil
+}
+
+// configureConnectionPool sets up optimal connection pool settings
+func configureConnectionPool(db *sql.DB) error {
+	// Maximum number of open connections to the database
+	maxOpenConns := getEnvAsInt("DB_MAX_OPEN_CONNS", 25)
+	db.SetMaxOpenConns(maxOpenConns)
+
+	// Maximum number of idle connections in the pool
+	maxIdleConns := getEnvAsInt("DB_MAX_IDLE_CONNS", 5)
+	db.SetMaxIdleConns(maxIdleConns)
+
+	// Maximum amount of time a connection may be reused (in minutes)
+	maxLifetimeMinutes := getEnvAsInt("DB_MAX_LIFETIME_MINUTES", 30)
+	db.SetConnMaxLifetime(time.Duration(maxLifetimeMinutes) * time.Minute)
+
+	// Maximum amount of time a connection may be idle (in minutes)
+	maxIdleTimeMinutes := getEnvAsInt("DB_MAX_IDLE_TIME_MINUTES", 15)
+	db.SetConnMaxIdleTime(time.Duration(maxIdleTimeMinutes) * time.Minute)
+
+	logrus.WithFields(logrus.Fields{
+		"max_open_conns":        maxOpenConns,
+		"max_idle_conns":        maxIdleConns,
+		"max_lifetime_minutes":  maxLifetimeMinutes,
+		"max_idle_time_minutes": maxIdleTimeMinutes,
+	}).Info("📊 Database connection pool configured")
+
+	return nil
 }
 
 func getDefaultPostgresURL() string {
@@ -46,6 +82,15 @@ func getDefaultPostgresURL() string {
 func getEnvOrDefault(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return defaultValue
+}
+
+func getEnvAsInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
 	}
 	return defaultValue
 }
@@ -86,7 +131,9 @@ func createTables(db *sql.DB) error {
 			file_size INTEGER DEFAULT 0,
 			success_rate REAL DEFAULT 100.0,
 			result_id TEXT,
-			session_id TEXT
+			session_id TEXT,
+			redaction_mode TEXT,
+			custom_labels TEXT
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS app_config (
@@ -159,6 +206,33 @@ func createTables(db *sql.DB) error {
 		// Add result_id and session_id columns to processing_history if they don't exist
 		`ALTER TABLE processing_history ADD COLUMN IF NOT EXISTS result_id TEXT`,
 		`ALTER TABLE processing_history ADD COLUMN IF NOT EXISTS session_id TEXT`,
+		`ALTER TABLE processing_history ADD COLUMN IF NOT EXISTS redaction_mode TEXT`,
+		`ALTER TABLE processing_history ADD COLUMN IF NOT EXISTS custom_labels TEXT`,
+	}
+
+	// Performance indexes for faster queries
+	performanceIndexes := []string{
+		// Primary lookup indexes
+		`CREATE INDEX IF NOT EXISTS idx_processing_rows_session_id ON processing_rows(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_processing_rows_session_row ON processing_rows(session_id, row_number)`,
+		`CREATE INDEX IF NOT EXISTS idx_detected_entities_session_id ON detected_entities(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_detected_entities_session_row ON detected_entities(session_id, row_number)`,
+
+		// History and results indexes
+		`CREATE INDEX IF NOT EXISTS idx_processing_history_session_id ON processing_history(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_processing_history_timestamp ON processing_history(timestamp DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_processing_results_created_at ON processing_results(created_at DESC)`,
+
+		// Query optimization indexes
+		`CREATE INDEX IF NOT EXISTS idx_processing_rows_status ON processing_rows(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_detected_entities_type ON detected_entities(entity_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_detected_entities_approved ON detected_entities(approved)`,
+		`CREATE INDEX IF NOT EXISTS idx_processing_history_filename ON processing_history(filename)`,
+
+		// Composite indexes for complex queries
+		`CREATE INDEX IF NOT EXISTS idx_processing_rows_session_status ON processing_rows(session_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_detected_entities_session_type ON detected_entities(session_id, entity_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_detected_entities_session_approved ON detected_entities(session_id, approved)`,
 	}
 
 	for _, migration := range migrations {
@@ -169,5 +243,15 @@ func createTables(db *sql.DB) error {
 		}
 	}
 
+	// Create performance indexes
+	for _, index := range performanceIndexes {
+		_, err := db.Exec(index)
+		if err != nil {
+			logrus.WithError(err).Warnf("Index creation failed (may already exist): %s", index)
+			// Don't return error as indexes might already exist
+		}
+	}
+
+	logrus.Info("📊 Database performance indexes created successfully")
 	return nil
 }

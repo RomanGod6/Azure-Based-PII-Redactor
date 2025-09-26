@@ -51,6 +51,8 @@ func SetupRoutes(router *gin.Engine, db *sql.DB, cfg *config.Config) {
 		v1.GET("/files/results/:id", fileHandler.GetProcessingResults)
 		v1.GET("/files/stream/:session_id", fileHandler.StreamProcessingResults)
 		v1.GET("/files/results/view/:session_id", fileHandler.GetProcessingRowsForViewer)
+		v1.GET("/files/sessions/:session_id/detail", fileHandler.GetSessionReviewData)
+		v1.POST("/files/sessions/:session_id/export", fileHandler.ExportSessionResults)
 		v1.GET("/files/legacy/:result_id", fileHandler.DownloadLegacyResults)
 
 		// History and analytics

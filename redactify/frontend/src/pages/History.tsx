@@ -13,6 +13,8 @@ interface HistoryItem {
   fallback_result_id?: string;
   fallback_session_id?: string;
   has_results?: boolean;
+  redaction_mode?: string;
+  custom_labels?: Record<string, string>;
 }
 
 interface HistoryData {
@@ -235,6 +237,14 @@ export const History: React.FC = () => {
                         >
                           👁️ View Details
                         </button>
+                        {item.session_id && (
+                          <button
+                            onClick={() => navigate(`/results/session/${item.session_id}?mode=review`)}
+                            className="text-blue-600 hover:text-blue-800 text-sm font-medium"
+                          >
+                            📝 Review
+                          </button>
+                        )}
                         <button 
                           onClick={() => handleDownloadResults(item, 'csv')}
                           disabled={downloading === item.id}

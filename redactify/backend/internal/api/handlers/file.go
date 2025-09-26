@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"redactify/internal/pii"
 	"redactify/pkg/config"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	"github.com/tealeg/xlsx/v3"
 )
@@ -48,6 +50,38 @@ type ProgressUpdate struct {
 	IsComplete bool                 `json:"is_complete"`
 	Entities   []pii.Entity         `json:"entities,omitempty"`
 	Results    *ProcessFileResponse `json:"results,omitempty"`
+}
+
+type sessionEntity struct {
+	ID         int64
+	RowNumber  int
+	Type       string
+	Text       string
+	Start      int
+	End        int
+	Confidence float64
+	Category   string
+	Approved   bool
+}
+
+type sessionRow struct {
+	RowNumber      int
+	OriginalText   string
+	StoredRedacted string
+	EntitiesCount  int
+	ProcessingTime float64
+	Status         string
+	ErrorMessage   string
+	CreatedAt      time.Time
+}
+
+type sessionMetadata struct {
+	Filename         string
+	Timestamp        time.Time
+	ProcessingTimeMs float64
+	EntitiesFound    int
+	RedactionMode    string
+	CustomLabels     map[string]string
 }
 
 func NewFileHandler(db *sql.DB, cfg *config.Config, wsHandler *WebSocketHandler) *FileHandler {
@@ -275,6 +309,12 @@ func (h *FileHandler) processCSVWithWebSocket(sessionID string, file io.Reader, 
 			logrus.WithError(saveErr).Errorf("Failed to save row %d to database", processedCount)
 		}
 
+		if len(result.Entities) > 0 {
+			if err := h.saveDetectedEntities(sessionID, result.Entities, processedCount); err != nil {
+				logrus.WithError(err).Warnf("Failed to persist detected entities for row %d", processedCount)
+			}
+		}
+
 		// Send progress update
 		h.wsHandler.UpdateProgress(sessionID, &ProgressUpdate{
 			CurrentRow: processedCount,
@@ -289,18 +329,17 @@ func (h *FileHandler) processCSVWithWebSocket(sessionID string, file io.Reader, 
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Get total entities count from saved rows (without loading all text into memory)
-	dbTotalEntities, err := h.getTotalEntitiesFromRows(sessionID)
+	// Get total entities count without loading all content into memory
+	totalEntities, err := h.buildResultsFromRowsStreaming(sessionID)
 	if err != nil {
-		logrus.WithError(err).Error("Failed to get entities count from saved rows")
-		h.wsHandler.NotifyError(sessionID, fmt.Errorf("failed to get results summary from database: %w", err))
+		logrus.WithError(err).Error("Failed to get entities count from stored rows")
+		h.wsHandler.NotifyError(sessionID, fmt.Errorf("failed to get entities count from database rows: %w", err))
 		return
 	}
 
 	processingTime := time.Since(startTime)
 
-	// Save metadata only to processing_results (no large text content)
-	resultID, err := h.saveProcessingResults(sessionID, filename, "", "", dbTotalEntities, processingTime, totalRows)
+	resultID, err := h.saveProcessingResultsMetadata(sessionID, filename, totalEntities, processingTime, totalRows)
 	if err != nil {
 		logrus.WithError(err).Error("Failed to save processing results")
 		h.wsHandler.NotifyError(sessionID, fmt.Errorf("failed to save processing results: %w", err))
@@ -309,9 +348,9 @@ func (h *FileHandler) processCSVWithWebSocket(sessionID string, file io.Reader, 
 
 	// Create lightweight response (no large content)
 	response := &ProcessFileResponse{
-		OriginalText:  "",              // Don't send large content via WebSocket
-		RedactedText:  "",              // Don't send large content via WebSocket
-		RedactedCount: dbTotalEntities, // Use entities count from database
+		OriginalText:  "",            // Don't send large content via WebSocket
+		RedactedText:  "",            // Don't send large content via WebSocket
+		RedactedCount: totalEntities, // Use entities count from database
 		ProcessTime:   fmt.Sprintf("%.2fms", float64(processingTime.Nanoseconds())/1000000),
 		RowsProcessed: totalRows,
 		FileName:      filename,
@@ -319,7 +358,18 @@ func (h *FileHandler) processCSVWithWebSocket(sessionID string, file io.Reader, 
 	}
 
 	// Save to history
-	go h.saveFileProcessingHistory(filename, dbTotalEntities, processingTime, totalRows, resultID, sessionID)
+	redactionMode := options.RedactionMode
+	if redactionMode == "" {
+		redactionMode = "replace"
+	}
+	var labelsCopy map[string]string
+	if len(options.CustomLabels) > 0 {
+		labelsCopy = make(map[string]string, len(options.CustomLabels))
+		for k, v := range options.CustomLabels {
+			labelsCopy[k] = v
+		}
+	}
+	go h.saveFileProcessingHistory(filename, totalEntities, processingTime, totalRows, resultID, sessionID, redactionMode, labelsCopy)
 
 	// Send completion signal with lightweight response
 	logrus.Infof("✅ File processing completed for session: %s, result ID: %s", sessionID, resultID)
@@ -430,15 +480,24 @@ func (h *FileHandler) GetFileStatus(c *gin.Context) {
 	})
 }
 
-func (h *FileHandler) saveFileProcessingHistory(filename string, entitiesFound int, processingTime time.Duration, rowsProcessed int, resultID, sessionID string) {
+func (h *FileHandler) saveFileProcessingHistory(filename string, entitiesFound int, processingTime time.Duration, rowsProcessed int, resultID, sessionID, redactionMode string, customLabels map[string]string) {
 	query := `
-		INSERT INTO processing_history (filename, entities_found, processing_time_ms, status, file_size, result_id, session_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO processing_history (filename, entities_found, processing_time_ms, status, file_size, result_id, session_id, redaction_mode, custom_labels)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`
 
 	processingTimeMs := float64(processingTime.Nanoseconds()) / 1000000
 
-	_, err := h.db.Exec(query, filename, entitiesFound, processingTimeMs, "completed", rowsProcessed, resultID, sessionID)
+	labelsJSON := ""
+	if len(customLabels) > 0 {
+		if data, err := json.Marshal(customLabels); err == nil {
+			labelsJSON = string(data)
+		} else {
+			logrus.WithError(err).Warn("Failed to marshal custom labels for history")
+		}
+	}
+
+	_, err := h.db.Exec(query, filename, entitiesFound, processingTimeMs, "completed", rowsProcessed, resultID, sessionID, redactionMode, labelsJSON)
 	if err != nil {
 		logrus.WithError(err).Error("Failed to save file processing history")
 	}
@@ -464,7 +523,42 @@ func sanitizeUTF8(text string) string {
 	return builder.String()
 }
 
-// saveProcessingResults saves full processing results to database and returns result ID
+// saveProcessingResultsMetadata saves processing metadata without storing full text content
+func (h *FileHandler) saveProcessingResultsMetadata(sessionID, filename string, entitiesFound int, processingTime time.Duration, rowsProcessed int) (string, error) {
+	resultID := sessionID // Use session ID as result ID for simplicity
+	sanitizedFilename := sanitizeUTF8(filename)
+
+	// Only store metadata, not full text content to avoid memory issues
+	query := `
+		INSERT INTO processing_results (id, filename, original_text, redacted_text, entities_found, processing_time_ms, rows_processed, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+		ON CONFLICT (id) DO UPDATE SET
+			filename = EXCLUDED.filename,
+			entities_found = EXCLUDED.entities_found,
+			processing_time_ms = EXCLUDED.processing_time_ms,
+			rows_processed = EXCLUDED.rows_processed,
+			created_at = CURRENT_TIMESTAMP
+	`
+
+	processingTimeMs := float64(processingTime.Nanoseconds()) / 1000000
+
+	// Store empty strings for text content - actual content is stored in processing_rows
+	_, err := h.db.Exec(query, resultID, sanitizedFilename, "", "", entitiesFound, processingTimeMs, rowsProcessed)
+	if err != nil {
+		return "", fmt.Errorf("failed to save processing results metadata: %w", err)
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"result_id":      resultID,
+		"filename":       filename,
+		"entities_found": entitiesFound,
+		"rows_processed": rowsProcessed,
+	}).Info("💾 Processing results metadata saved to database")
+
+	return resultID, nil
+}
+
+// saveProcessingResults saves full processing results to database and returns result ID (LEGACY - use with caution)
 func (h *FileHandler) saveProcessingResults(sessionID, filename, originalText, redactedText string, entitiesFound int, processingTime time.Duration, rowsProcessed int) (string, error) {
 	resultID := sessionID // Use session ID as result ID for simplicity
 
@@ -562,9 +656,13 @@ func (h *FileHandler) getTotalEntitiesFromRows(sessionID string) (int, error) {
 	return totalEntities, nil
 }
 
-// buildResultsFromRows retrieves and combines all processed rows for a session
-// WARNING: This loads all results into memory - only use when specifically requested by user
-func (h *FileHandler) buildResultsFromRows(sessionID string) (string, string, int, error) {
+// buildResultsFromRowsStreaming retrieves summary statistics without loading all content into memory
+func (h *FileHandler) buildResultsFromRowsStreaming(sessionID string) (int, error) {
+	return h.getTotalEntitiesFromRows(sessionID)
+}
+
+// streamResultsToWriter streams processing results to a writer without loading all into memory
+func (h *FileHandler) streamResultsToWriter(sessionID string, writer io.Writer) error {
 	query := `
 		SELECT original_text, redacted_text, entities_count
 		FROM processing_rows
@@ -574,35 +672,68 @@ func (h *FileHandler) buildResultsFromRows(sessionID string) (string, string, in
 
 	rows, err := h.db.Query(query, sessionID)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("failed to query row results: %w", err)
+		return fmt.Errorf("failed to query row results: %w", err)
 	}
 	defer rows.Close()
-
-	var originalRows []string
-	var redactedRows []string
-	totalEntities := 0
 
 	for rows.Next() {
 		var original, redacted string
 		var entities int
 
 		if err := rows.Scan(&original, &redacted, &entities); err != nil {
-			return "", "", 0, fmt.Errorf("failed to scan row result: %w", err)
+			return fmt.Errorf("failed to scan row result: %w", err)
+		}
+
+		// Write line with proper newline handling
+		if _, err := writer.Write([]byte(redacted + "\n")); err != nil {
+			return fmt.Errorf("failed to write row result: %w", err)
+		}
+	}
+
+	return rows.Err()
+}
+
+// buildResultsFromRowsPaginated retrieves rows in chunks to avoid memory issues
+func (h *FileHandler) buildResultsFromRowsPaginated(sessionID string, offset, limit int) ([]string, []string, int, bool, error) {
+	query := `
+		SELECT original_text, redacted_text, entities_count
+		FROM processing_rows
+		WHERE session_id = $1
+		ORDER BY row_number ASC
+		LIMIT $2 OFFSET $3
+	`
+
+	rows, err := h.db.Query(query, sessionID, limit, offset)
+	if err != nil {
+		return nil, nil, 0, false, fmt.Errorf("failed to query row results: %w", err)
+	}
+	defer rows.Close()
+
+	var originalRows []string
+	var redactedRows []string
+	totalEntities := 0
+	rowCount := 0
+
+	for rows.Next() {
+		var original, redacted string
+		var entities int
+
+		if err := rows.Scan(&original, &redacted, &entities); err != nil {
+			return nil, nil, 0, false, fmt.Errorf("failed to scan row result: %w", err)
 		}
 
 		originalRows = append(originalRows, original)
 		redactedRows = append(redactedRows, redacted)
 		totalEntities += entities
+		rowCount++
 	}
 
 	if err := rows.Err(); err != nil {
-		return "", "", 0, fmt.Errorf("error iterating rows: %w", err)
+		return nil, nil, 0, false, fmt.Errorf("error iterating rows: %w", err)
 	}
 
-	originalText := strings.Join(originalRows, "\n")
-	redactedText := strings.Join(redactedRows, "\n")
-
-	return originalText, redactedText, totalEntities, nil
+	hasMore := rowCount == limit
+	return originalRows, redactedRows, totalEntities, hasMore, nil
 }
 
 // saveDetectedEntities saves individual detected entities to the database
@@ -626,6 +757,291 @@ func (h *FileHandler) saveDetectedEntities(sessionID string, entities []pii.Enti
 	return nil
 }
 
+func parseCustomLabels(raw string) map[string]string {
+	if strings.TrimSpace(raw) == "" {
+		return map[string]string{}
+	}
+
+	labels := make(map[string]string)
+	if err := json.Unmarshal([]byte(raw), &labels); err != nil {
+		logrus.WithError(err).Warn("Failed to parse custom labels from history")
+		return map[string]string{}
+	}
+	return labels
+}
+
+func mergeCustomLabels(base, overrides map[string]string) map[string]string {
+	if len(base) == 0 && len(overrides) == 0 {
+		return map[string]string{}
+	}
+
+	merged := make(map[string]string, len(base)+len(overrides))
+	for k, v := range base {
+		merged[k] = v
+	}
+	for k, v := range overrides {
+		if strings.TrimSpace(v) == "" {
+			continue
+		}
+		merged[k] = v
+	}
+
+	return merged
+}
+
+func (h *FileHandler) getSessionMetadata(sessionID string) (*sessionMetadata, error) {
+	query := `
+		SELECT filename, timestamp, processing_time_ms, entities_found, redaction_mode, custom_labels
+		FROM processing_history
+		WHERE session_id = $1
+		ORDER BY timestamp DESC
+		LIMIT 1
+	`
+
+	var (
+		filename        string
+		timestamp       time.Time
+		processingMs    sql.NullFloat64
+		entitiesFound   sql.NullInt64
+		redactionMode   sql.NullString
+		customLabelsRaw sql.NullString
+	)
+
+	err := h.db.QueryRow(query, sessionID).Scan(&filename, &timestamp, &processingMs, &entitiesFound, &redactionMode, &customLabelsRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	metadata := &sessionMetadata{
+		Filename:         filename,
+		Timestamp:        timestamp,
+		ProcessingTimeMs: processingMs.Float64,
+		EntitiesFound:    int(entitiesFound.Int64),
+		RedactionMode:    redactionMode.String,
+		CustomLabels:     parseCustomLabels(customLabelsRaw.String),
+	}
+
+	if metadata.RedactionMode == "" {
+		metadata.RedactionMode = "replace"
+	}
+
+	return metadata, nil
+}
+
+func (h *FileHandler) fetchSessionRows(sessionID string) ([]sessionRow, error) {
+	query := `
+		SELECT row_number, original_text, redacted_text, entities_count, processing_time_ms, status, COALESCE(error_message, ''), created_at
+		FROM processing_rows
+		WHERE session_id = $1
+		ORDER BY row_number ASC
+	`
+
+	rows, err := h.db.Query(query, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query processing rows: %w", err)
+	}
+	defer rows.Close()
+
+	var results []sessionRow
+	for rows.Next() {
+		var (
+			rowNumber      int
+			originalText   sql.NullString
+			storedRedacted sql.NullString
+			entitiesCount  sql.NullInt64
+			processingMs   sql.NullFloat64
+			status         sql.NullString
+			errorMessage   string
+			createdAt      time.Time
+		)
+
+		if err := rows.Scan(&rowNumber, &originalText, &storedRedacted, &entitiesCount, &processingMs, &status, &errorMessage, &createdAt); err != nil {
+			return nil, fmt.Errorf("failed to scan processing row: %w", err)
+		}
+
+		results = append(results, sessionRow{
+			RowNumber:      rowNumber,
+			OriginalText:   originalText.String,
+			StoredRedacted: storedRedacted.String,
+			EntitiesCount:  int(entitiesCount.Int64),
+			ProcessingTime: processingMs.Float64,
+			Status:         status.String,
+			ErrorMessage:   errorMessage,
+			CreatedAt:      createdAt,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating processing rows: %w", err)
+	}
+
+	return results, nil
+}
+
+func (h *FileHandler) fetchSessionEntities(sessionID string) ([]sessionEntity, error) {
+	query := `
+		SELECT id, row_number, entity_type, entity_text, start_position, end_position, confidence, category, approved
+		FROM detected_entities
+		WHERE session_id = $1
+		ORDER BY row_number ASC, start_position ASC
+	`
+
+	rows, err := h.db.Query(query, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query detected entities: %w", err)
+	}
+	defer rows.Close()
+
+	var entities []sessionEntity
+	for rows.Next() {
+		var (
+			id         int64
+			rowNumber  int
+			entityType string
+			entityText string
+			startPos   sql.NullInt64
+			endPos     sql.NullInt64
+			confidence sql.NullFloat64
+			category   sql.NullString
+			approved   sql.NullBool
+		)
+
+		if err := rows.Scan(&id, &rowNumber, &entityType, &entityText, &startPos, &endPos, &confidence, &category, &approved); err != nil {
+			return nil, fmt.Errorf("failed to scan detected entity: %w", err)
+		}
+
+		entity := sessionEntity{
+			ID:         id,
+			RowNumber:  rowNumber,
+			Type:       entityType,
+			Text:       entityText,
+			Start:      int(startPos.Int64),
+			End:        int(endPos.Int64),
+			Confidence: confidence.Float64,
+			Category:   category.String,
+			Approved:   true,
+		}
+
+		if approved.Valid {
+			entity.Approved = approved.Bool
+		}
+
+		entities = append(entities, entity)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating detected entities: %w", err)
+	}
+
+	return entities, nil
+}
+
+func buildRowRedaction(original string, entities []sessionEntity, redactionMode string, customLabels map[string]string, skip map[int64]bool) (string, int) {
+	if len(entities) == 0 {
+		return original, 0
+	}
+
+	replacements := make([]sessionEntity, 0, len(entities))
+	for _, entity := range entities {
+		approved := entity.Approved
+		if skip != nil {
+			_, shouldSkip := skip[entity.ID]
+			approved = !shouldSkip
+		}
+
+		if !approved {
+			continue
+		}
+
+		replacements = append(replacements, entity)
+	}
+
+	if len(replacements) == 0 {
+		return original, 0
+	}
+
+	// Sort replacements in reverse order of start to maintain byte offsets
+	sort.Slice(replacements, func(i, j int) bool {
+		return replacements[i].Start > replacements[j].Start
+	})
+
+	redacted := original
+	for _, entity := range replacements {
+		// Validate bounds against the original text
+		if entity.Start < 0 || entity.End > len(original) || entity.Start >= entity.End {
+			logrus.WithFields(logrus.Fields{
+				"start":        entity.Start,
+				"end":          entity.End,
+				"row_number":   entity.RowNumber,
+				"entity_text":  entity.Text,
+				"original_len": len(original),
+			}).Warn("Skipping entity with invalid bounds during redaction rebuild")
+			continue
+		}
+
+		// Since we're processing in reverse order, we can validate against current redacted length
+		if entity.Start >= len(redacted) || entity.End > len(redacted) {
+			logrus.WithFields(logrus.Fields{
+				"start":        entity.Start,
+				"end":          entity.End,
+				"row_number":   entity.RowNumber,
+				"entity_text":  entity.Text,
+				"redacted_len": len(redacted),
+			}).Warn("Skipping entity due to redacted text length mismatch")
+			continue
+		}
+
+		replacement := resolveReplacement(entity, redactionMode, customLabels)
+		before := redacted[:entity.Start]
+		after := redacted[entity.End:]
+		redacted = before + replacement + after
+	}
+
+	return redacted, len(replacements)
+}
+
+// cleanUTF8 ensures the string contains only valid UTF-8 sequences
+func cleanUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+
+	// Replace invalid sequences with replacement character
+	return strings.ToValidUTF8(s, "�")
+}
+
+func resolveReplacement(entity sessionEntity, redactionMode string, customLabels map[string]string) string {
+	if label, exists := customLabels[entity.Type]; exists && label != "" {
+		return label
+	}
+
+	defaultLabels := map[string]string{
+		"Person":      "[REDACTED_NAME]",
+		"email":       "[REDACTED_EMAIL]",
+		"phone":       "[REDACTED_PHONE]",
+		"ssn":         "[REDACTED_SSN]",
+		"credit_card": "[REDACTED_CARD]",
+		"ip_address":  "[REDACTED_IP]",
+	}
+
+	if label, exists := defaultLabels[entity.Type]; exists {
+		return label
+	}
+
+	switch redactionMode {
+	case "mask":
+		return strings.Repeat("*", len(entity.Text))
+	case "remove":
+		return ""
+	default:
+		if entity.Type != "" {
+			upper := strings.ToUpper(entity.Type)
+			return fmt.Sprintf("[REDACTED_%s]", upper)
+		}
+		return "[REDACTED]"
+	}
+}
+
 // StreamProcessingResults streams processing results row by row without loading all into memory
 func (h *FileHandler) StreamProcessingResults(c *gin.Context) {
 	sessionID := c.Param("session_id")
@@ -637,7 +1053,7 @@ func (h *FileHandler) StreamProcessingResults(c *gin.Context) {
 	format := c.DefaultQuery("format", "csv") // csv or json
 
 	query := `
-		SELECT row_number, original_text, redacted_text, entities_count, error_message
+		SELECT row_number, original_text, redacted_text, entities_count, COALESCE(error_message, '') as error_message
 		FROM processing_rows
 		WHERE session_id = $1
 		ORDER BY row_number ASC
@@ -654,45 +1070,77 @@ func (h *FileHandler) StreamProcessingResults(c *gin.Context) {
 	if format == "csv" {
 		c.Header("Content-Type", "text/csv")
 		c.Header("Content-Disposition", "attachment; filename=processing_results.csv")
-		c.Writer.WriteString("row_number,original_text,redacted_text,entities_count,error\n")
+
+		// Use CSV writer for proper escaping and performance
+		csvWriter := csv.NewWriter(c.Writer)
+		csvWriter.Write([]string{"row_number", "original_text", "redacted_text", "entities_count", "error"})
+
+		rowCount := 0
+		for rows.Next() {
+			var rowNum int
+			var original, redacted, errorMsg string
+			var entities int
+
+			if err := rows.Scan(&rowNum, &original, &redacted, &entities, &errorMsg); err != nil {
+				logrus.WithError(err).Error("Failed to scan processing row")
+				continue
+			}
+
+			record := []string{
+				strconv.Itoa(rowNum),
+				original,
+				redacted,
+				strconv.Itoa(entities),
+				errorMsg,
+			}
+
+			if err := csvWriter.Write(record); err != nil {
+				logrus.WithError(err).Error("Failed to write CSV record")
+				break
+			}
+
+			// Flush every 100 rows for better streaming performance
+			rowCount++
+			if rowCount%100 == 0 {
+				csvWriter.Flush()
+			}
+		}
+
+		csvWriter.Flush()
 	} else {
 		c.Header("Content-Type", "application/json")
 		c.Writer.WriteString(`{"results":[`)
-	}
 
-	first := true
-	for rows.Next() {
-		var rowNum int
-		var original, redacted, errorMsg sql.NullString
-		var entities int
+		first := true
+		for rows.Next() {
+			var rowNum int
+			var original, redacted, errorMsg string
+			var entities int
 
-		if err := rows.Scan(&rowNum, &original, &redacted, &entities, &errorMsg); err != nil {
-			logrus.WithError(err).Error("Failed to scan processing row")
-			continue
-		}
+			if err := rows.Scan(&rowNum, &original, &redacted, &entities, &errorMsg); err != nil {
+				logrus.WithError(err).Error("Failed to scan processing row")
+				continue
+			}
 
-		if format == "csv" {
-			// CSV format - escape quotes and commas
-			origText := strings.ReplaceAll(original.String, `"`, `""`)
-			redText := strings.ReplaceAll(redacted.String, `"`, `""`)
-			errText := strings.ReplaceAll(errorMsg.String, `"`, `""`)
-
-			c.Writer.WriteString(fmt.Sprintf(`%d,"%s","%s",%d,"%s"`+"\n",
-				rowNum, origText, redText, entities, errText))
-		} else {
-			// JSON format
 			if !first {
 				c.Writer.WriteString(",")
 			}
-			c.Writer.WriteString(fmt.Sprintf(`{"row_number":%d,"original_text":%q,"redacted_text":%q,"entities_count":%d,"error":%q}`,
-				rowNum, original.String, redacted.String, entities, errorMsg.String))
+
+			// Use json.Marshal for proper escaping
+			data := map[string]interface{}{
+				"row_number":     rowNum,
+				"original_text":  original,
+				"redacted_text":  redacted,
+				"entities_count": entities,
+				"error":         errorMsg,
+			}
+
+			if jsonBytes, err := json.Marshal(data); err == nil {
+				c.Writer.Write(jsonBytes)
+			}
 			first = false
 		}
 
-		c.Writer.Flush() // Stream immediately
-	}
-
-	if format == "json" {
 		c.Writer.WriteString("]}")
 	}
 
@@ -828,6 +1276,353 @@ func (h *FileHandler) GetProcessingRowsForViewer(c *gin.Context) {
 			"has_more":   offset+limit < metadata.TotalRows,
 		},
 	})
+}
+
+// GetSessionReviewData returns consolidated data needed for the interactive review workspace
+func (h *FileHandler) GetSessionReviewData(c *gin.Context) {
+	sessionID := c.Param("session_id")
+	if strings.TrimSpace(sessionID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Session ID is required"})
+		return
+	}
+
+	metadata, err := h.getSessionMetadata(sessionID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
+			return
+		}
+		logrus.WithError(err).Error("Failed to fetch session metadata")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load session metadata"})
+		return
+	}
+
+	rows, err := h.fetchSessionRows(sessionID)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to load session rows")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load session rows"})
+		return
+	}
+
+	entities, err := h.fetchSessionEntities(sessionID)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to load session entities")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load detected entities"})
+		return
+	}
+
+	entitiesByRow := make(map[int][]sessionEntity)
+	for _, entity := range entities {
+		entitiesByRow[entity.RowNumber] = append(entitiesByRow[entity.RowNumber], entity)
+	}
+
+	customLabels := metadata.CustomLabels
+	if customLabels == nil {
+		customLabels = map[string]string{}
+	}
+
+	rowsPayload := make([]gin.H, 0, len(rows))
+	finalRedactedLines := make([]string, 0, len(rows))
+	originalLines := make([]string, 0, len(rows))
+	approvedTotal := 0
+
+	for _, row := range rows {
+		rowEntities := entitiesByRow[row.RowNumber]
+		finalRedacted, approvedCount := buildRowRedaction(row.OriginalText, rowEntities, metadata.RedactionMode, customLabels, nil)
+
+		approvedTotal += approvedCount
+		finalRedactedLines = append(finalRedactedLines, finalRedacted)
+		originalLines = append(originalLines, row.OriginalText)
+
+		rowsPayload = append(rowsPayload, gin.H{
+			"row_number":           row.RowNumber,
+			"original_text":        row.OriginalText,
+			"stored_redacted_text": row.StoredRedacted,
+			"review_redacted_text": finalRedacted,
+			"detected_entities":    row.EntitiesCount,
+			"approved_entities":    approvedCount,
+			"processing_time_ms":   row.ProcessingTime,
+			"status":               row.Status,
+			"error_message":        row.ErrorMessage,
+			"was_redacted":         finalRedacted != row.OriginalText,
+			"created_at":           row.CreatedAt.Format(time.RFC3339),
+		})
+	}
+
+	entityPayload := make([]gin.H, 0, len(entities))
+	for _, entity := range entities {
+		entityPayload = append(entityPayload, gin.H{
+			"id":         entity.ID,
+			"row_number": entity.RowNumber,
+			"type":       entity.Type,
+			"text":       entity.Text,
+			"start":      entity.Start,
+			"end":        entity.End,
+			"confidence": entity.Confidence,
+			"category":   entity.Category,
+			"approved":   entity.Approved,
+		})
+	}
+
+	response := gin.H{
+		"session_id":         sessionID,
+		"filename":           metadata.Filename,
+		"created_at":         metadata.Timestamp.Format(time.RFC3339),
+		"processing_time_ms": metadata.ProcessingTimeMs,
+		"redaction_mode":     metadata.RedactionMode,
+		"custom_labels":      customLabels,
+		"rows":               rowsPayload,
+		"entities":           entityPayload,
+		"summary": gin.H{
+			"total_rows":        len(rows),
+			"total_entities":    len(entities),
+			"approved_entities": approvedTotal,
+		},
+		"full_original_text": strings.Join(originalLines, "\n"),
+		"full_redacted_text": strings.Join(finalRedactedLines, "\n"),
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// ExportSessionResults applies user approvals and streams a CSV for the specified session
+func (h *FileHandler) ExportSessionResults(c *gin.Context) {
+	sessionID := c.Param("session_id")
+	if strings.TrimSpace(sessionID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Session ID is required"})
+		return
+	}
+
+	var req struct {
+		RedactionMode     string            `json:"redaction_mode"`
+		CustomLabels      map[string]string `json:"custom_labels"`
+		SkippedEntityIDs  []int64           `json:"skipped_entity_ids"`
+		IncludeErrorField bool              `json:"include_error_field"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logrus.WithError(err).Warn("Invalid export request payload")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid export request"})
+		return
+	}
+
+	metadata, err := h.getSessionMetadata(sessionID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
+			return
+		}
+		logrus.WithError(err).Error("Failed to load session metadata for export")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load session metadata"})
+		return
+	}
+
+	rows, err := h.fetchSessionRows(sessionID)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to load rows for export")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load processing rows"})
+		return
+	}
+
+	entities, err := h.fetchSessionEntities(sessionID)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to load entities for export")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load detected entities"})
+		return
+	}
+
+	entitiesByRow := make(map[int][]sessionEntity)
+	for _, entity := range entities {
+		entitiesByRow[entity.RowNumber] = append(entitiesByRow[entity.RowNumber], entity)
+	}
+
+	redactionMode := metadata.RedactionMode
+	if req.RedactionMode != "" {
+		redactionMode = req.RedactionMode
+	}
+
+	customLabels := mergeCustomLabels(metadata.CustomLabels, req.CustomLabels)
+	skipSet := make(map[int64]bool, len(req.SkippedEntityIDs))
+	for _, id := range req.SkippedEntityIDs {
+		skipSet[id] = true
+	}
+
+	totalApproved := 0
+	approvedIDs := make([]int64, 0, len(entities))
+	skippedIDs := make([]int64, 0, len(req.SkippedEntityIDs))
+
+	// Pre-process entity approvals without storing all rows in memory
+	for _, row := range rows {
+		rowEntities := entitiesByRow[row.RowNumber]
+		_, approvedCount := buildRowRedaction(row.OriginalText, rowEntities, redactionMode, customLabels, skipSet)
+
+		for _, entity := range rowEntities {
+			if skipSet[entity.ID] {
+				skippedIDs = append(skippedIDs, entity.ID)
+				continue
+			}
+			approvedIDs = append(approvedIDs, entity.ID)
+		}
+
+		totalApproved += approvedCount
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		logrus.WithError(err).Error("Failed to start transaction for export updates")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare export"})
+		return
+	}
+
+	if len(approvedIDs) > 0 {
+		if _, execErr := tx.Exec(`UPDATE detected_entities SET approved = TRUE WHERE id = ANY($1)`, pq.Array(approvedIDs)); execErr != nil {
+			_ = tx.Rollback()
+			logrus.WithError(execErr).Error("Failed to persist approved entities")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to persist approvals"})
+			return
+		}
+	}
+
+	if len(skippedIDs) > 0 {
+		if _, execErr := tx.Exec(`UPDATE detected_entities SET approved = FALSE WHERE id = ANY($1)`, pq.Array(skippedIDs)); execErr != nil {
+			_ = tx.Rollback()
+			logrus.WithError(execErr).Error("Failed to persist skipped entities")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to persist approvals"})
+			return
+		}
+	}
+
+	// Update redacted text for each row (streaming approach - one row at a time)
+	for _, row := range rows {
+		rowEntities := entitiesByRow[row.RowNumber]
+		finalRedacted, _ := buildRowRedaction(row.OriginalText, rowEntities, redactionMode, customLabels, skipSet)
+
+		// Clean the redacted text to ensure valid UTF-8 before database insert
+		cleanedRedacted := cleanUTF8(finalRedacted)
+
+		if _, execErr := tx.Exec(`UPDATE processing_rows SET redacted_text = $1 WHERE session_id = $2 AND row_number = $3`, cleanedRedacted, sessionID, row.RowNumber); execErr != nil {
+			_ = tx.Rollback()
+			logrus.WithError(execErr).Error("Failed to update row redacted text")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to persist redacted rows"})
+			return
+		}
+	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		logrus.WithError(commitErr).Error("Failed to commit export updates")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to finalize export"})
+		return
+	}
+
+	processingDuration := time.Duration(metadata.ProcessingTimeMs * float64(time.Millisecond))
+
+	// Use metadata-only save to avoid memory issues with large files
+	if _, err := h.saveProcessingResultsMetadata(sessionID, metadata.Filename, totalApproved, processingDuration, len(rows)); err != nil {
+		logrus.WithError(err).Warn("Failed to persist aggregated processing results after export")
+	}
+
+	labelsJSON := ""
+	if len(customLabels) > 0 {
+		if data, marshalErr := json.Marshal(customLabels); marshalErr == nil {
+			labelsJSON = string(data)
+		} else {
+			logrus.WithError(marshalErr).Warn("Failed to marshal custom labels for history update")
+		}
+	}
+
+	if _, err := h.db.Exec(`UPDATE processing_history SET entities_found = $1, redaction_mode = $2, custom_labels = $3 WHERE session_id = $4`, totalApproved, redactionMode, labelsJSON, sessionID); err != nil {
+		logrus.WithError(err).Warn("Failed to update processing history with export summary")
+	}
+
+	filename := strings.TrimSpace(metadata.Filename)
+	if filename == "" {
+		filename = fmt.Sprintf("session_%s", sessionID)
+	}
+	filename = strings.ReplaceAll(filename, " ", "_")
+	if strings.HasSuffix(strings.ToLower(filename), ".csv") {
+		filename = strings.TrimSuffix(filename, ".csv")
+	}
+	filename = filename + "_redacted.csv"
+
+	c.Header("Content-Type", "text/csv")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+
+	writer := csv.NewWriter(c.Writer)
+	headers := []string{"row_number", "original_text", "redacted_text", "approved_entities"}
+	if req.IncludeErrorField {
+		headers = append(headers, "error")
+	}
+
+	if err := writer.Write(headers); err != nil {
+		logrus.WithError(err).Error("Failed to write CSV header")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to stream export"})
+		return
+	}
+
+	// Stream CSV rows directly from database without loading all into memory
+	if err := h.streamExportRows(writer, sessionID, entitiesByRow, redactionMode, customLabels, skipSet, req.IncludeErrorField); err != nil {
+		logrus.WithError(err).Error("Failed to stream export rows")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to stream export"})
+		return
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		logrus.WithError(err).Error("CSV writer encountered an error")
+	}
+}
+
+// streamExportRows streams CSV rows directly from database without loading all into memory
+func (h *FileHandler) streamExportRows(writer *csv.Writer, sessionID string, entitiesByRow map[int][]sessionEntity, redactionMode string, customLabels map[string]string, skipSet map[int64]bool, includeErrorField bool) error {
+	query := `
+		SELECT row_number, original_text, COALESCE(error_message, '') as error_message
+		FROM processing_rows
+		WHERE session_id = $1
+		ORDER BY row_number ASC
+	`
+
+	rows, err := h.db.Query(query, sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to query processing rows for export: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var rowNumber int
+		var originalText, errorMessage string
+
+		if err := rows.Scan(&rowNumber, &originalText, &errorMessage); err != nil {
+			return fmt.Errorf("failed to scan processing row for export: %w", err)
+		}
+
+		// Build redacted text for this row
+		rowEntities := entitiesByRow[rowNumber]
+		finalRedacted, approvedCount := buildRowRedaction(originalText, rowEntities, redactionMode, customLabels, skipSet)
+
+		// Create CSV record
+		record := []string{
+			strconv.Itoa(rowNumber),
+			originalText,
+			finalRedacted,
+			strconv.Itoa(approvedCount),
+		}
+
+		if includeErrorField {
+			record = append(record, errorMessage)
+		}
+
+		// Write record immediately (streaming)
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("failed to write CSV record for row %d: %w", rowNumber, err)
+		}
+
+		// Flush periodically to avoid buffering too much
+		if rowNumber%100 == 0 {
+			writer.Flush()
+		}
+	}
+
+	return rows.Err()
 }
 
 // DownloadLegacyResults serves results from the old processing_results table (before incremental system)
@@ -980,13 +1775,12 @@ func (h *FileHandler) processCSVWithProgress(c *gin.Context, file io.Reader, fil
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Combine all results
-	finalText := strings.Join(redactedRows, "\n")
+	// Don't combine all results to avoid memory issues - let frontend request data as needed
 	processingTime := time.Since(startTime)
 
 	response := &ProcessFileResponse{
-		OriginalText:  finalText, // Send redacted as "original" for frontend
-		RedactedText:  finalText,
+		OriginalText:  "", // Don't send large content in response
+		RedactedText:  "", // Don't send large content in response
 		RedactedCount: totalEntities,
 		ProcessTime:   fmt.Sprintf("%.2fms", float64(processingTime.Nanoseconds())/1000000),
 		RowsProcessed: totalRows,
@@ -994,7 +1788,18 @@ func (h *FileHandler) processCSVWithProgress(c *gin.Context, file io.Reader, fil
 	}
 
 	// Save to history
-	go h.saveFileProcessingHistory(filename, totalEntities, processingTime, totalRows, "", "")
+	redactionMode := "replace"
+	if options != nil && options.RedactionMode != "" {
+		redactionMode = options.RedactionMode
+	}
+	var customLabels map[string]string
+	if options != nil && len(options.CustomLabels) > 0 {
+		customLabels = make(map[string]string, len(options.CustomLabels))
+		for k, v := range options.CustomLabels {
+			customLabels[k] = v
+		}
+	}
+	go h.saveFileProcessingHistory(filename, totalEntities, processingTime, totalRows, "", "", redactionMode, customLabels)
 
 	// Send final completion signal
 	logrus.Info("✅ Sending final completion signal")
@@ -1065,19 +1870,29 @@ func (h *FileHandler) processExcelWithProgress(c *gin.Context, file io.Reader, f
 		})
 	}
 
-	finalText := strings.Join(redactedRows, "\n")
 	processingTime := time.Since(startTime)
 
 	response := &ProcessFileResponse{
-		OriginalText:  finalText,
-		RedactedText:  finalText,
+		OriginalText:  "", // Don't send large content in response
+		RedactedText:  "", // Don't send large content in response
 		RedactedCount: totalEntities,
 		ProcessTime:   fmt.Sprintf("%.2fms", float64(processingTime.Nanoseconds())/1000000),
 		RowsProcessed: totalRows,
 		FileName:      filename,
 	}
 
-	go h.saveFileProcessingHistory(filename, totalEntities, processingTime, totalRows, "", "")
+	redactionMode := "replace"
+	if options != nil && options.RedactionMode != "" {
+		redactionMode = options.RedactionMode
+	}
+	var customLabels map[string]string
+	if options != nil && len(options.CustomLabels) > 0 {
+		customLabels = make(map[string]string, len(options.CustomLabels))
+		for k, v := range options.CustomLabels {
+			customLabels[k] = v
+		}
+	}
+	go h.saveFileProcessingHistory(filename, totalEntities, processingTime, totalRows, "", "", redactionMode, customLabels)
 
 	// Send final completion signal
 	logrus.Info("✅ Sending final completion signal for Excel")
@@ -1122,19 +1937,29 @@ func (h *FileHandler) processTextWithProgress(c *gin.Context, file io.Reader, fi
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	finalText := strings.Join(redactedLines, "\n")
 	processingTime := time.Since(startTime)
 
 	response := &ProcessFileResponse{
-		OriginalText:  finalText,
-		RedactedText:  finalText,
+		OriginalText:  "", // Don't send large content in response
+		RedactedText:  "", // Don't send large content in response
 		RedactedCount: totalEntities,
 		ProcessTime:   fmt.Sprintf("%.2fms", float64(processingTime.Nanoseconds())/1000000),
 		RowsProcessed: totalLines,
 		FileName:      filename,
 	}
 
-	go h.saveFileProcessingHistory(filename, totalEntities, processingTime, totalLines, "", "")
+	redactionMode := "replace"
+	if options != nil && options.RedactionMode != "" {
+		redactionMode = options.RedactionMode
+	}
+	var customLabels map[string]string
+	if options != nil && len(options.CustomLabels) > 0 {
+		customLabels = make(map[string]string, len(options.CustomLabels))
+		for k, v := range options.CustomLabels {
+			customLabels[k] = v
+		}
+	}
+	go h.saveFileProcessingHistory(filename, totalEntities, processingTime, totalLines, "", "", redactionMode, customLabels)
 
 	// Send final completion signal
 	logrus.Info("✅ Sending final completion signal for text file")

@@ -1,6 +1,9 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { FeedbackTrainer } from '../components/FeedbackTrainer';
+import { PerformanceDashboard } from '../components/PerformanceDashboard';
 import { fileProcessingWebSocket } from '../services/websocket';
+import { sessionPersistence, SessionState } from '../services/sessionPersistence';
+import { performanceMonitor } from '../services/performanceMonitor';
 
 interface ProcessingOptions {
   redactionMode: 'replace' | 'mask' | 'remove';
@@ -49,7 +52,7 @@ export const FileProcessor: React.FC = () => {
   const [processingMode, setProcessingMode] = useState<'file' | 'text'>('file');
   const [showTrainer, setShowTrainer] = useState(false);
   const [originalContent, setOriginalContent] = useState('');
-  
+
   // Filtering and pagination state
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedEntityTypes, setSelectedEntityTypes] = useState<Set<string>>(new Set<string>());
@@ -58,6 +61,18 @@ export const FileProcessor: React.FC = () => {
   const [itemsPerPage, setItemsPerPage] = useState(50);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const entitiesBufferRef = useRef<DetectedEntity[]>([]);
+
+  // Error recovery and progressive loading state
+  const [error, setError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [showProgressDetails, setShowProgressDetails] = useState(false);
+  const [recoveredSession, setRecoveredSession] = useState<SessionState | null>(null);
+  const [showPerformanceDashboard, setShowPerformanceDashboard] = useState(false);
+
+  // Performance monitoring state
+  const [processingStartTime, setProcessingStartTime] = useState<number | null>(null);
 
   // Fetch training statistics when component mounts or step changes to options
   useEffect(() => {
@@ -81,6 +96,161 @@ export const FileProcessor: React.FC = () => {
       setTrainingStats({ count: 0, entityTypes: [] });
     }
   };
+
+  // Enhanced session management with crash recovery
+  const createProcessingSession = useCallback((file: File | null, textContent: string) => {
+    try {
+      let sessionId: string;
+
+      if (file) {
+        sessionId = sessionPersistence.createProcessingSession(
+          file.name,
+          file.size,
+          file.type,
+          options
+        );
+      } else {
+        sessionId = sessionPersistence.createTextProcessingSession(options);
+      }
+
+      setCurrentSessionId(sessionId);
+      return sessionId;
+    } catch (error) {
+      console.warn('Failed to create processing session:', error);
+      return null;
+    }
+  }, [options]);
+
+  const updateSessionProgress = useCallback((progress: number, entitiesCount?: number, processingSessionId?: string) => {
+    if (currentSessionId) {
+      try {
+        sessionPersistence.updateSession(currentSessionId, {
+          progress,
+          entitiesCount,
+          sessionId: processingSessionId,
+          status: progress >= 100 ? 'completed' : 'active',
+          lastUpdate: Date.now()
+        });
+      } catch (error) {
+        console.warn('Failed to update session progress:', error);
+      }
+    }
+  }, [currentSessionId]);
+
+  const handleSessionError = useCallback((errorMessage: string) => {
+    if (currentSessionId) {
+      try {
+        sessionPersistence.updateSession(currentSessionId, {
+          status: 'error',
+          errorMessage,
+          retryCount,
+          lastUpdate: Date.now()
+        });
+      } catch (error) {
+        console.warn('Failed to update session error:', error);
+      }
+    }
+  }, [currentSessionId, retryCount]);
+
+  const clearCurrentSession = useCallback(() => {
+    if (currentSessionId) {
+      try {
+        sessionPersistence.updateSession(currentSessionId, {
+          status: 'completed',
+          lastUpdate: Date.now()
+        });
+        setCurrentSessionId(null);
+      } catch (error) {
+        console.warn('Failed to clear current session:', error);
+      }
+    }
+  }, [currentSessionId]);
+
+  const handleError = useCallback((error: string, canRetry: boolean = true) => {
+    console.error('Processing error:', error);
+    setError(error);
+    setStep('processing'); // Stay on processing step to show error
+
+    // Update session with error
+    handleSessionError(error);
+
+    // Record error in performance monitoring
+    performanceMonitor.recordError(currentSessionId || undefined);
+
+    if (canRetry && retryCount < 3) {
+      // Auto-retry after a delay for network errors
+      setTimeout(() => {
+        if (error.includes('network') || error.includes('connection') || error.includes('timeout')) {
+          handleRetry();
+        }
+      }, 5000 * (retryCount + 1)); // Exponential backoff
+    }
+  }, [retryCount, handleSessionError, currentSessionId]);
+
+  const handleRetry = useCallback(async () => {
+    if (isRetrying) return;
+
+    setIsRetrying(true);
+    setError(null);
+    setRetryCount(prev => prev + 1);
+
+    try {
+      // Wait a bit before retrying
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Retry the processing
+      if (file && processingMode === 'file') {
+        await processFile();
+      } else if (textInput && processingMode === 'text') {
+        await processFile();
+      }
+    } catch (error) {
+      handleError(error instanceof Error ? error.message : 'Retry failed');
+    } finally {
+      setIsRetrying(false);
+    }
+  }, [isRetrying, file, processingMode, textInput]);
+
+  // Check for recovery sessions on component mount
+  useEffect(() => {
+    const recoverySessions = sessionPersistence.getRecoverySessions();
+    const processingSession = recoverySessions.find(s =>
+      s.type === 'file_processing' || s.type === 'text_processing'
+    );
+
+    if (processingSession && processingSession.progress > 0 && processingSession.progress < 100) {
+      setRecoveredSession(processingSession);
+      setCurrentSessionId(processingSession.id);
+
+      // Try to restore basic state
+      if (processingSession.progress > 0) {
+        setProgress(processingSession.progress);
+        setProgressMessage(`Recovered session - ${processingSession.progress.toFixed(1)}% complete`);
+      }
+
+      // If session was viewing results, redirect
+      if (processingSession.sessionId && processingSession.progress >= 100) {
+        window.location.href = `/results/${processingSession.sessionId}?mode=review&recovered=true`;
+      } else {
+        // Show recovery UI
+        setStep('processing');
+      }
+    }
+
+    // Also check for URL recovery parameter
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('recovered') === 'true') {
+      // User was redirected here for recovery
+      const activeSessions = sessionPersistence.getActiveSessions();
+      const activeProcessing = activeSessions.find(s =>
+        s.type === 'file_processing' || s.type === 'text_processing'
+      );
+      if (activeProcessing) {
+        setRecoveredSession(activeProcessing);
+        setCurrentSessionId(activeProcessing.id);
+      }
+    }
+  }, []);
 
   const handleDrag = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -113,14 +283,31 @@ export const FileProcessor: React.FC = () => {
   const processFile = async () => {
     if (!file && !textInput) return;
 
+    // Clear any previous errors
+    setError(null);
+    setRetryCount(0);
+
     setStep('processing');
     setProgress(0);
     setProgressMessage('Initializing...');
     entitiesBufferRef.current = [];
     setEntities([]);
 
+    // Create new processing session
+    const sessionId = createProcessingSession(file, textInput);
+    if (!sessionId) {
+      handleError('Failed to create processing session', false);
+      return;
+    }
+
+    // Start performance monitoring
+    setProcessingStartTime(Date.now());
+    performanceMonitor.startMonitoring();
+
     try {
       if (processingMode === 'text') {
+        setProgressMessage('Processing text...');
+
         // Process text directly using existing API
         const response = await fetch('http://localhost:8080/api/v1/pii/redact', {
           method: 'POST',
@@ -139,21 +326,38 @@ export const FileProcessor: React.FC = () => {
         });
 
         if (!response.ok) {
-          throw new Error('Text processing failed');
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.error || `Text processing failed: ${response.status}`);
         }
 
         const data = await response.json();
         setResults(data);
         setOriginalContent(data.original_text || textInput);
-        
+
         if (data.entities) {
           data.entities.forEach((entity: DetectedEntity) => {
             entity.approved = true;
           });
           setEntities(data.entities);
+          // Update session with completion
+          updateSessionProgress(100, data.entities.length);
         }
-        
+
         setStep('review');
+
+        // Record performance metrics
+        if (processingStartTime) {
+          const processingTime = Date.now() - processingStartTime;
+          performanceMonitor.recordProcessingMetrics(
+            processingTime,
+            1, // Single text processing counts as 1 row
+            data.entities?.length || 0,
+            textInput.length,
+            sessionId
+          );
+        }
+
+        clearCurrentSession(); // Clear session on successful completion
       } else {
         // Process file using WebSocket
         console.log('🚀 Frontend: Processing file with WebSocket', {
@@ -165,7 +369,7 @@ export const FileProcessor: React.FC = () => {
         // Convert file to base64 for WebSocket transmission
         const fileContent = await fileToBase64(file!);
         
-        // Set up WebSocket handlers
+        // Set up WebSocket handlers with progressive state saving
         fileProcessingWebSocket.setProgressHandler((progressData: any) => {
           console.log('📊 Progress update:', progressData);
 
@@ -179,11 +383,17 @@ export const FileProcessor: React.FC = () => {
           }
 
           // Update progress
+          let currentProgress = progress;
           if (progressData.total_rows > 0) {
-            const progressPercent = Math.min(100, (progressData.current_row / progressData.total_rows) * 100);
-            setProgress(progressPercent);
+            currentProgress = Math.min(100, (progressData.current_row / progressData.total_rows) * 100);
+            setProgress(currentProgress);
           }
-          
+
+          // Save progress state periodically (every 5% or 100 rows)
+          if (progressData.current_row % 100 === 0 || currentProgress % 5 < 1) {
+            updateSessionProgress(currentProgress, entitiesBufferRef.current.length, progressData.session_id || null);
+          }
+
           // Update status message
           if (progressData.message) {
             console.log(`🔄 ${progressData.message}`);
@@ -252,12 +462,27 @@ export const FileProcessor: React.FC = () => {
           setConfidenceThreshold(0);
           setCurrentPage(1);
           setStep('review');
+
+          // Record performance metrics for file processing
+          if (processingStartTime && parsedResults.rows_processed) {
+            const processingTime = Date.now() - processingStartTime;
+            performanceMonitor.recordProcessingMetrics(
+              processingTime,
+              parsedResults.rows_processed,
+              finalEntities.length,
+              file?.size,
+              sessionId
+            );
+          }
+
+          // Clear session on successful completion
+          clearCurrentSession();
         });
 
         fileProcessingWebSocket.setErrorHandler((error: any) => {
           console.error('❌ Processing error:', error);
-          alert(`Processing failed: ${error.message || 'Unknown error'}`);
-          setStep('options');
+          const errorMessage = error.message || 'Processing failed due to unknown error';
+          handleError(errorMessage, true); // Enable retry for WebSocket errors
         });
 
         fileProcessingWebSocket.setRateLimitHandler((rateLimitInfo: any) => {
@@ -281,8 +506,8 @@ export const FileProcessor: React.FC = () => {
       }
     } catch (error) {
       console.error('Processing error:', error);
-      alert('Processing failed. Please try again.');
-      setStep('options');
+      const errorMessage = error instanceof Error ? error.message : 'Processing failed';
+      handleError(errorMessage, true);
     }
   };
 
@@ -532,11 +757,69 @@ export const FileProcessor: React.FC = () => {
   return (
     <div className="space-y-6">
       <div className="border-b border-gray-200 pb-4">
-        <h1 className="text-3xl font-bold text-gray-900">Process Files</h1>
-        <p className="text-gray-600 mt-2">
-          Upload files or enter text for PII detection and redaction
-        </p>
+        <div className="flex justify-between items-start">
+          <div>
+            <h1 className="text-3xl font-bold text-gray-900">Process Files</h1>
+            <p className="text-gray-600 mt-2">
+              Upload files or enter text for PII detection and redaction
+            </p>
+          </div>
+          <button
+            onClick={() => setShowPerformanceDashboard(true)}
+            className="flex items-center space-x-2 px-3 py-2 text-sm bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+            title="Open Performance Dashboard"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+            </svg>
+            <span>Performance</span>
+          </button>
+        </div>
       </div>
+
+      {/* Session Recovery Information */}
+      {recoveredSession && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6">
+          <div className="flex items-start">
+            <div className="text-yellow-600 mr-3">
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <div className="flex-1">
+              <h4 className="text-yellow-800 font-semibold mb-1">Session Recovered</h4>
+              <p className="text-yellow-700 text-sm mb-3">
+                Your previous {recoveredSession.type.replace('_', ' ')} session has been restored.
+                {recoveredSession.fileName && ` File: ${recoveredSession.fileName}`}
+                {recoveredSession.progress > 0 && ` (${recoveredSession.progress.toFixed(1)}% complete)`}
+              </p>
+              <div className="flex space-x-2">
+                <button
+                  onClick={() => {
+                    if (recoveredSession.progress >= 100 && recoveredSession.sessionId) {
+                      window.location.href = `/results/${recoveredSession.sessionId}?mode=review`;
+                    } else {
+                      setStep('processing');
+                    }
+                  }}
+                  className="text-sm bg-yellow-200 text-yellow-800 px-3 py-1 rounded hover:bg-yellow-300 transition-colors"
+                >
+                  {recoveredSession.progress >= 100 ? 'View Results' : 'Continue Session'}
+                </button>
+                <button
+                  onClick={() => {
+                    clearCurrentSession();
+                    setRecoveredSession(null);
+                  }}
+                  className="text-sm bg-gray-200 text-gray-700 px-3 py-1 rounded hover:bg-gray-300 transition-colors"
+                >
+                  Start Fresh
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Step Indicator */}
       <div className="flex justify-center">
@@ -824,26 +1107,115 @@ export const FileProcessor: React.FC = () => {
       {step === 'processing' && (
         <div className="card">
           <div className="text-center py-8">
-            <div className="text-6xl mb-4">🔄</div>
-            <h3 className="text-xl font-semibold text-gray-900 mb-2">Processing Your File</h3>
-            <p className="text-gray-500 mb-6">
-              {progressMessage || 'Scanning for PII using advanced AI detection...'}
-            </p>
-            <div className="w-full bg-gray-200 rounded-full h-3 mb-4">
-              <div 
-                className="bg-blue-600 h-3 rounded-full transition-all duration-500 ease-out"
-                style={{ width: `${progress}%` }}
-              ></div>
-            </div>
-            <p className="text-sm text-gray-500 mb-4">{Math.round(progress)}% complete</p>
-            
-            {/* Cancel Button */}
-            <button
-              onClick={cancelProcessing}
-              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
-            >
-              Cancel Processing
-            </button>
+            {error ? (
+              // Error state
+              <>
+                <div className="text-6xl mb-4">❌</div>
+                <h3 className="text-xl font-semibold text-red-700 mb-2">Processing Error</h3>
+                <p className="text-red-600 mb-6">{error}</p>
+
+                {retryCount < 3 && (
+                  <div className="mb-6">
+                    <button
+                      onClick={handleRetry}
+                      disabled={isRetrying}
+                      className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 transition-colors mr-4"
+                    >
+                      {isRetrying ? 'Retrying...' : `Retry (${3 - retryCount} attempts left)`}
+                    </button>
+                    <button
+                      onClick={() => {
+                        clearCurrentSession();
+                        setError(null);
+                        setStep('options');
+                      }}
+                      className="px-6 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors"
+                    >
+                      Start Over
+                    </button>
+                  </div>
+                )}
+
+                {retryCount >= 3 && (
+                  <div className="mb-6">
+                    <p className="text-gray-600 mb-4">Maximum retry attempts reached.</p>
+                    <button
+                      onClick={() => {
+                        clearCurrentSession();
+                        setError(null);
+                        setRetryCount(0);
+                        setStep('options');
+                      }}
+                      className="px-6 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors"
+                    >
+                      Start Over
+                    </button>
+                  </div>
+                )}
+
+                {progress > 0 && (
+                  <div className="mt-6 p-4 bg-yellow-50 rounded-lg">
+                    <p className="text-sm text-yellow-800 mb-2">
+                      Processing was {progress.toFixed(1)}% complete when the error occurred.
+                    </p>
+                    <p className="text-xs text-yellow-600">
+                      Your progress has been saved and will be restored if you retry.
+                    </p>
+                  </div>
+                )}
+              </>
+            ) : (
+              // Normal processing state
+              <>
+                <div className="text-6xl mb-4">🔄</div>
+                <h3 className="text-xl font-semibold text-gray-900 mb-2">Processing Your File</h3>
+                <p className="text-gray-500 mb-6">
+                  {progressMessage || 'Scanning for PII using advanced AI detection...'}
+                </p>
+                <div className="w-full bg-gray-200 rounded-full h-3 mb-4">
+                  <div
+                    className="bg-blue-600 h-3 rounded-full transition-all duration-500 ease-out"
+                    style={{ width: `${progress}%` }}
+                  ></div>
+                </div>
+                <p className="text-sm text-gray-500 mb-4">{Math.round(progress)}% complete</p>
+
+                {/* Progress details toggle */}
+                <button
+                  onClick={() => setShowProgressDetails(!showProgressDetails)}
+                  className="text-sm text-blue-600 hover:text-blue-800 mb-4"
+                >
+                  {showProgressDetails ? 'Hide' : 'Show'} Details
+                </button>
+
+                {showProgressDetails && (
+                  <div className="mb-6 p-4 bg-gray-50 rounded-lg text-sm text-gray-600 text-left">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <strong>Entities Found:</strong> {entities.length}
+                      </div>
+                      <div>
+                        <strong>Retry Count:</strong> {retryCount}
+                      </div>
+                      <div>
+                        <strong>File:</strong> {file?.name || 'Text Input'}
+                      </div>
+                      <div>
+                        <strong>Mode:</strong> {processingMode}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Cancel Button */}
+                <button
+                  onClick={cancelProcessing}
+                  className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
+                >
+                  Cancel Processing
+                </button>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -1144,6 +1516,12 @@ export const FileProcessor: React.FC = () => {
           file_content: originalContent.split('\n'),
           detected_entities: entities
         } : null}
+      />
+
+      {/* Performance Dashboard Modal */}
+      <PerformanceDashboard
+        isOpen={showPerformanceDashboard}
+        onClose={() => setShowPerformanceDashboard(false)}
       />
     </div>
   );
