@@ -16,8 +16,8 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true // Allow connections from any origin in development
 	},
-	ReadBufferSize:  1024 * 4,  // 4KB read buffer
-	WriteBufferSize: 1024 * 4,  // 4KB write buffer
+	ReadBufferSize:  1024 * 4, // 4KB read buffer
+	WriteBufferSize: 1024 * 4, // 4KB write buffer
 }
 
 // ProcessingSession represents an active file processing session with enhanced buffering
@@ -32,14 +32,14 @@ type ProcessingSession struct {
 	Context    map[string]interface{} `json:"context"`
 
 	// Enhanced buffering and connection management
-	MessageBuffer  chan WebSocketMessage `json:"-"`
-	IsConnected    bool                  `json:"-"`
-	LastPong       time.Time             `json:"-"`
-	BufferSize     int                   `json:"-"`
-	DroppedMessages int64                `json:"dropped_messages"`
-	ctx            context.Context       `json:"-"`
-	cancel         context.CancelFunc    `json:"-"`
-	mu             sync.RWMutex          `json:"-"`
+	MessageBuffer   chan WebSocketMessage `json:"-"`
+	IsConnected     bool                  `json:"-"`
+	LastPong        time.Time             `json:"-"`
+	BufferSize      int                   `json:"-"`
+	DroppedMessages int64                 `json:"dropped_messages"`
+	ctx             context.Context       `json:"-"`
+	cancel          context.CancelFunc    `json:"-"`
+	mu              sync.RWMutex          `json:"-"`
 }
 
 // WebSocketMessage represents messages sent over WebSocket
@@ -109,9 +109,6 @@ func (wsh *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 
 // CreateSession creates a new processing session with enhanced buffering
 func (wsh *WebSocketHandler) CreateSession(filename string, conn *websocket.Conn) string {
-	wsh.mutex.Lock()
-	defer wsh.mutex.Unlock()
-
 	sessionID := generateSessionID()
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -132,7 +129,10 @@ func (wsh *WebSocketHandler) CreateSession(filename string, conn *websocket.Conn
 		cancel:          cancel,
 	}
 
+	// Store session with lock
+	wsh.mutex.Lock()
 	wsh.sessions[sessionID] = session
+	wsh.mutex.Unlock()
 
 	// Start buffered message sender goroutine
 	go wsh.messageBufferHandler(session)
@@ -142,11 +142,11 @@ func (wsh *WebSocketHandler) CreateSession(filename string, conn *websocket.Conn
 
 	logrus.Infof("📝 Created processing session: %s for file: %s with enhanced buffering", sessionID, filename)
 
-	// Send session creation notification through buffer
+	// Send session creation notification through buffer (outside of lock to prevent deadlock)
 	wsh.sendBufferedMessage(sessionID, WebSocketMessage{
 		Type:      "session_created",
 		SessionID: sessionID,
-		Data:      map[string]interface{}{
+		Data: map[string]interface{}{
 			"id":         sessionID,
 			"filename":   filename,
 			"status":     "starting",
@@ -559,7 +559,6 @@ func (wsh *WebSocketHandler) sendBufferedMessage(sessionID string, msg WebSocket
 		logrus.Warnf("Attempt to send message to non-existent session: %s", sessionID)
 		return
 	}
-
 	select {
 	case session.MessageBuffer <- msg:
 		// Message successfully buffered

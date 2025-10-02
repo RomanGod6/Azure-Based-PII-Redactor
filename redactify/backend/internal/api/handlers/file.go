@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"redactify/internal/pii"
 	"redactify/pkg/config"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,7 +19,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	"github.com/tealeg/xlsx/v3"
@@ -141,32 +141,62 @@ func (h *FileHandler) ProcessFileWebSocket(c *gin.Context) {
 		RedactOptions *pii.RedactOptions `json:"redact_options"`
 	}
 
+	logrus.Info("🔍 Waiting for file processing request via WebSocket...")
+
 	err = conn.ReadJSON(&processRequest)
 	if err != nil {
-		logrus.WithError(err).Error("Failed to read file processing request")
+		logrus.WithError(err).Error("❌ Failed to read file processing request")
 		return
 	}
 
+	logrus.WithFields(logrus.Fields{
+		"filename":          processRequest.FileName,
+		"file_type":         processRequest.FileType,
+		"content_length":    len(processRequest.FileContent),
+		"has_redact_options": processRequest.RedactOptions != nil,
+	}).Info("✅ Received file processing request via WebSocket")
+
 	// Create processing session
 	sessionID := h.wsHandler.CreateSession(processRequest.FileName, conn)
+	logrus.WithField("session_id", sessionID).Info("✅ CreateSession completed, sessionID created")
 
 	// Start processing in goroutine
-	go h.processFileWithWebSocket(sessionID, &processRequest)
-
-	// Keep connection alive and handle client messages
-	for {
-		var msg WebSocketMessage
-		err := conn.ReadJSON(&msg)
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				logrus.WithError(err).Error("WebSocket error during file processing")
+	logrus.WithField("session_id", sessionID).Info("🚀 Starting processing goroutine...")
+	go func() {
+		logrus.WithField("session_id", sessionID).Info("🎯 Goroutine started executing")
+		defer func() {
+			if r := recover(); r != nil {
+				logrus.WithFields(logrus.Fields{
+					"session_id": sessionID,
+					"panic":      r,
+					"stack":      string(debug.Stack()),
+				}).Error("💥 PANIC in processFileWithWebSocket goroutine")
 			}
+		}()
+		h.processFileWithWebSocket(sessionID, &processRequest)
+	}()
+
+	// Wait for processing to complete by monitoring the session status
+	logrus.WithField("session_id", sessionID).Info("✅ Processing goroutine launched, waiting for completion...")
+
+	// Keep the WebSocket connection alive by waiting for processing completion
+	// Check session status periodically until it's completed
+	for {
+		time.Sleep(100 * time.Millisecond) // Check every 100ms
+
+		h.wsHandler.mutex.RLock()
+		session, exists := h.wsHandler.sessions[sessionID]
+		if !exists {
+			h.wsHandler.mutex.RUnlock()
+			logrus.WithField("session_id", sessionID).Info("Session no longer exists, connection ending")
 			break
 		}
 
-		// Handle client messages (like cancel requests)
-		if msg.Type == "cancel" {
-			logrus.Infof("Processing cancelled for session: %s", sessionID)
+		status := session.Status
+		h.wsHandler.mutex.RUnlock()
+
+		if status == "completed" || status == "error" {
+			logrus.WithField("session_id", sessionID).Info("Processing completed, connection can close")
 			break
 		}
 	}
@@ -181,6 +211,14 @@ func (h *FileHandler) processFileWithWebSocket(sessionID string, request *struct
 }) {
 	startTime := time.Now()
 	logrus.Infof("🚀 Starting WebSocket file processing for session: %s", sessionID)
+
+	// Debug: Log that this function is actually being called
+	logrus.WithFields(logrus.Fields{
+		"session_id": sessionID,
+		"filename":   request.FileName,
+		"file_type":  request.FileType,
+		"content_length": len(request.FileContent),
+	}).Info("🔍 processFileWithWebSocket called")
 
 	// Decode base64 content
 	decoded, err := base64.StdEncoding.DecodeString(request.FileContent)
@@ -224,21 +262,25 @@ func (h *FileHandler) processCSVWithWebSocket(sessionID string, file io.Reader, 
 	delimiters := []rune{',', ';', '\t', '|'}
 	var records [][]string
 	var headers []string
+	var delimiter rune = ','  // default to comma
 
-	for _, delimiter := range delimiters {
+	logrus.WithField("session_id", sessionID).Info("🔍 Starting CSV delimiter detection")
+
+	for _, testDelimiter := range delimiters {
 		reader := csv.NewReader(strings.NewReader(contentStr))
-		reader.Comma = delimiter
+		reader.Comma = testDelimiter
 		reader.FieldsPerRecord = -1 // Allow variable number of fields
 
 		tempRecords, err := reader.ReadAll()
 		if err != nil {
-			logrus.WithField("delimiter", string(delimiter)).Warn("⚠️ Failed to parse with delimiter")
+			logrus.WithField("delimiter", string(testDelimiter)).Warn("⚠️ Failed to parse with delimiter")
 			continue
 		}
 
 		if len(tempRecords) > 1 { // At least header + 1 data row
 			records = tempRecords
 			headers = records[0]
+			delimiter = testDelimiter  // capture the successful delimiter
 			logrus.WithFields(logrus.Fields{
 				"session_id": sessionID,
 				"delimiter":  string(delimiter),
@@ -249,7 +291,52 @@ func (h *FileHandler) processCSVWithWebSocket(sessionID string, file io.Reader, 
 		}
 	}
 
+	// Store CSV metadata
+	headersJSON, err := json.Marshal(headers)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to marshal CSV headers")
+		h.wsHandler.NotifyError(sessionID, fmt.Errorf("failed to process CSV headers"))
+		return
+	}
+
+	// Initialize column PII settings (all enabled by default)
+	columnPIISettings := make(map[string]bool)
+	for _, header := range headers {
+		columnPIISettings[header] = true
+	}
+	columnPIISettingsJSON, err := json.Marshal(columnPIISettings)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to marshal column PII settings")
+		h.wsHandler.NotifyError(sessionID, fmt.Errorf("failed to initialize column settings"))
+		return
+	}
+
+	// Store CSV metadata in database
+	_, err = h.db.Exec(`
+		INSERT INTO csv_metadata (session_id, headers, column_pii_settings, delimiter, has_headers, total_columns)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (session_id) DO UPDATE SET
+			headers = EXCLUDED.headers,
+			column_pii_settings = EXCLUDED.column_pii_settings,
+			delimiter = EXCLUDED.delimiter,
+			has_headers = EXCLUDED.has_headers,
+			total_columns = EXCLUDED.total_columns
+	`, sessionID, string(headersJSON), string(columnPIISettingsJSON), string(delimiter), true, len(headers))
+
+	if err != nil {
+		logrus.WithError(err).Error("Failed to store CSV metadata")
+		h.wsHandler.NotifyError(sessionID, fmt.Errorf("failed to store CSV metadata"))
+		return
+	}
+
 	totalRows := len(records) - 1 // Subtract header
+	logrus.WithFields(logrus.Fields{
+		"session_id":    sessionID,
+		"total_records": len(records),
+		"total_rows":    totalRows,
+		"headers":       headers,
+	}).Info("🔍 CSV parsing completed successfully")
+
 	if totalRows <= 0 {
 		logrus.WithFields(logrus.Fields{
 			"session_id":      sessionID,
@@ -273,14 +360,59 @@ func (h *FileHandler) processCSVWithWebSocket(sessionID string, file io.Reader, 
 	})
 
 	// Process each row individually
+	logrus.WithFields(logrus.Fields{
+		"session_id":   sessionID,
+		"total_rows":   totalRows,
+		"total_records": len(records),
+	}).Info("🔍 Starting row-by-row processing")
+
 	for i, record := range records {
 		if i == 0 { // Skip header
 			continue
 		}
 
-		rowText := strings.Join(record, " ")
 		processedCount++
 		rowStartTime := time.Now()
+
+		// Store structured row data
+		columnDataJSON, err := json.Marshal(record)
+		if err != nil {
+			logrus.WithError(err).Warnf("Failed to marshal row %d data", processedCount)
+			continue
+		}
+
+		// Store row data in csv_row_data table
+		_, err = h.db.Exec(`
+			INSERT INTO csv_row_data (session_id, row_number, column_data)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (session_id, row_number) DO UPDATE SET
+				column_data = EXCLUDED.column_data
+		`, sessionID, processedCount, string(columnDataJSON))
+
+		if err != nil {
+			logrus.WithError(err).Warnf("Failed to store row %d data", processedCount)
+		}
+
+		// Build text for PII detection from enabled columns only
+		var piiEnabledText []string
+		for j, cellValue := range record {
+			if j < len(headers) && columnPIISettings[headers[j]] {
+				piiEnabledText = append(piiEnabledText, cellValue)
+			}
+		}
+
+		rowText := strings.Join(piiEnabledText, " ")
+
+		// Debug log for troubleshooting - using Info level to ensure visibility
+		logrus.WithFields(logrus.Fields{
+			"session_id":         sessionID,
+			"row_number":         processedCount,
+			"pii_enabled_count":  len(piiEnabledText),
+			"rowText_length":     len(rowText),
+			"headers_count":      len(headers),
+			"record_count":       len(record),
+			"rowText_preview":    rowText[:minInt(50, len(rowText))],
+		}).Info("🔍 Processing row with PII settings")
 
 		// Process this row through PII detection with rate limiting handling
 		result, err := h.detectWithRateLimit(sessionID, rowText, options)
@@ -1547,21 +1679,73 @@ func (h *FileHandler) ExportSessionResults(c *gin.Context) {
 	c.Header("Content-Type", "text/csv")
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 
-	writer := csv.NewWriter(c.Writer)
-	headers := []string{"row_number", "original_text", "redacted_text", "approved_entities"}
-	if req.IncludeErrorField {
-		headers = append(headers, "error")
-	}
+	// Get CSV metadata to restore original format
+	var headersJSON, columnPIISettingsJSON, delimiter string
+	var hasHeaders bool
+	err = h.db.QueryRow(`
+		SELECT headers, column_pii_settings, delimiter, has_headers
+		FROM csv_metadata
+		WHERE session_id = $1
+	`, sessionID).Scan(&headersJSON, &columnPIISettingsJSON, &delimiter, &hasHeaders)
 
-	if err := writer.Write(headers); err != nil {
-		logrus.WithError(err).Error("Failed to write CSV header")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to stream export"})
+	if err != nil {
+		// Fallback to old format if no CSV metadata found
+		logrus.WithError(err).Warn("No CSV metadata found, falling back to legacy export format")
+		writer := csv.NewWriter(c.Writer)
+		headers := []string{"row_number", "original_text", "redacted_text", "approved_entities"}
+		if req.IncludeErrorField {
+			headers = append(headers, "error")
+		}
+
+		if err := writer.Write(headers); err != nil {
+			logrus.WithError(err).Error("Failed to write CSV header")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to stream export"})
+			return
+		}
+
+		// Use legacy export logic
+		if streamErr := h.streamExportRows(writer, sessionID, entitiesByRow, redactionMode, customLabels, skipSet, req.IncludeErrorField); streamErr != nil {
+			logrus.WithError(streamErr).Error("Failed to stream export rows")
+			return
+		}
+
+		writer.Flush()
 		return
 	}
 
-	// Stream CSV rows directly from database without loading all into memory
-	if err := h.streamExportRows(writer, sessionID, entitiesByRow, redactionMode, customLabels, skipSet, req.IncludeErrorField); err != nil {
-		logrus.WithError(err).Error("Failed to stream export rows")
+	// Parse CSV metadata
+	var originalHeaders []string
+	if err := json.Unmarshal([]byte(headersJSON), &originalHeaders); err != nil {
+		logrus.WithError(err).Error("Failed to parse original headers")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse CSV headers"})
+		return
+	}
+
+	var columnPIISettings map[string]bool
+	if err := json.Unmarshal([]byte(columnPIISettingsJSON), &columnPIISettings); err != nil {
+		logrus.WithError(err).Error("Failed to parse column PII settings")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse column settings"})
+		return
+	}
+
+	// Set up CSV writer with original delimiter
+	writer := csv.NewWriter(c.Writer)
+	if delimiter != "" && len(delimiter) > 0 {
+		writer.Comma = rune(delimiter[0])
+	}
+
+	// Write original headers
+	if hasHeaders {
+		if err := writer.Write(originalHeaders); err != nil {
+			logrus.WithError(err).Error("Failed to write CSV headers")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write CSV headers"})
+			return
+		}
+	}
+
+	// Stream CSV rows in original format
+	if err := h.streamStructuredCSVRows(writer, sessionID, originalHeaders, columnPIISettings, entitiesByRow, redactionMode, customLabels, skipSet); err != nil {
+		logrus.WithError(err).Error("Failed to stream structured CSV rows")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to stream export"})
 		return
 	}
@@ -1623,6 +1807,135 @@ func (h *FileHandler) streamExportRows(writer *csv.Writer, sessionID string, ent
 	}
 
 	return rows.Err()
+}
+
+// streamStructuredCSVRows streams CSV rows in original format with PII redaction applied per column
+func (h *FileHandler) streamStructuredCSVRows(writer *csv.Writer, sessionID string, headers []string, columnPIISettings map[string]bool, entitiesByRow map[int][]sessionEntity, redactionMode string, customLabels map[string]string, skipSet map[int64]bool) error {
+	query := `
+		SELECT cr.row_number, cr.column_data, pr.original_text
+		FROM csv_row_data cr
+		JOIN processing_rows pr ON cr.session_id = pr.session_id AND cr.row_number = pr.row_number
+		WHERE cr.session_id = $1
+		ORDER BY cr.row_number ASC
+	`
+
+	rows, err := h.db.Query(query, sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to query structured CSV data: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var rowNumber int
+		var columnDataJSON, originalText string
+
+		if err := rows.Scan(&rowNumber, &columnDataJSON, &originalText); err != nil {
+			return fmt.Errorf("failed to scan structured CSV row %d: %w", rowNumber, err)
+		}
+
+		// Parse column data
+		var columnData []string
+		if err := json.Unmarshal([]byte(columnDataJSON), &columnData); err != nil {
+			return fmt.Errorf("failed to parse column data for row %d: %w", rowNumber, err)
+		}
+
+		// Get entities for this row
+		rowEntities := entitiesByRow[rowNumber]
+
+		// Build the redacted row using the correct mapping approach
+		redactedRow, err := h.buildRedactedCSVRow(columnData, headers, columnPIISettings, originalText, rowEntities, redactionMode, customLabels, skipSet)
+		if err != nil {
+			logrus.WithError(err).WithField("row_number", rowNumber).Warn("Failed to build redacted row, using original")
+			redactedRow = columnData
+		}
+
+		// Write the redacted row
+		if err := writer.Write(redactedRow); err != nil {
+			return fmt.Errorf("failed to write CSV record for row %d: %w", rowNumber, err)
+		}
+
+		// Flush periodically
+		if rowNumber%100 == 0 {
+			writer.Flush()
+		}
+	}
+
+	return rows.Err()
+}
+
+// buildRedactedCSVRow correctly applies redaction to individual CSV columns
+func (h *FileHandler) buildRedactedCSVRow(columnData []string, headers []string, columnPIISettings map[string]bool, originalText string, entities []sessionEntity, redactionMode string, customLabels map[string]string, skipSet map[int64]bool) ([]string, error) {
+	redactedRow := make([]string, len(columnData))
+
+	// If no entities detected, return original columns
+	if len(entities) == 0 {
+		return columnData, nil
+	}
+
+	// Apply redaction per-column basis - this is the correct approach
+	for i, cellValue := range columnData {
+		if i >= len(headers) {
+			// Handle case where row has more columns than headers
+			redactedRow[i] = cellValue
+			continue
+		}
+
+		headerName := headers[i]
+		if !columnPIISettings[headerName] {
+			// PII processing disabled for this column, keep original
+			redactedRow[i] = cellValue
+		} else {
+			// PII processing enabled for this column
+			// Find entities that are relevant to this specific cell content
+			redactedRow[i] = h.redactCellValue(cellValue, entities, redactionMode, customLabels, skipSet)
+		}
+	}
+
+	return redactedRow, nil
+}
+
+
+// redactCellValue applies redaction to a single cell value
+func (h *FileHandler) redactCellValue(cellValue string, entities []sessionEntity, redactionMode string, customLabels map[string]string, skipSet map[int64]bool) string {
+	// Find entities that are contained within this specific cell
+	var relevantEntities []sessionEntity
+	for _, entity := range entities {
+		// Check if the entity text is actually found in this cell
+		if strings.Contains(cellValue, entity.Text) {
+			relevantEntities = append(relevantEntities, entity)
+		}
+	}
+
+	if len(relevantEntities) == 0 {
+		return cellValue
+	}
+
+	// Apply redaction using buildRowRedaction on just this cell
+	redacted, _ := buildRowRedaction(cellValue, relevantEntities, redactionMode, customLabels, skipSet)
+	return redacted
+}
+
+// determineColumnRedaction determines the appropriate redaction for a column value
+func (h *FileHandler) determineColumnRedaction(cellValue string, entities []sessionEntity, redactionMode string, customLabels map[string]string) string {
+	if len(entities) == 0 {
+		return cellValue
+	}
+
+	// Find the most relevant entity for this cell
+	var relevantEntity *sessionEntity
+	for _, entity := range entities {
+		if strings.Contains(cellValue, entity.Text) {
+			relevantEntity = &entity
+			break
+		}
+	}
+
+	if relevantEntity == nil {
+		// No direct match, use first entity as fallback
+		relevantEntity = &entities[0]
+	}
+
+	return resolveReplacement(*relevantEntity, redactionMode, customLabels)
 }
 
 // DownloadLegacyResults serves results from the old processing_results table (before incremental system)
@@ -2023,6 +2336,123 @@ func (h *FileHandler) GetProcessingResults(c *gin.Context) {
 	}).Info("📤 Retrieved processing results from database")
 
 	c.JSON(http.StatusOK, result)
+}
+
+// GetCSVMetadata returns CSV headers and column PII settings for a session
+func (h *FileHandler) GetCSVMetadata(c *gin.Context) {
+	sessionID := c.Param("session_id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Session ID is required"})
+		return
+	}
+
+	var headersJSON, columnPIISettingsJSON, delimiter string
+	var hasHeaders bool
+	var totalColumns int
+
+	err := h.db.QueryRow(`
+		SELECT headers, column_pii_settings, delimiter, has_headers, total_columns
+		FROM csv_metadata
+		WHERE session_id = $1
+	`, sessionID).Scan(&headersJSON, &columnPIISettingsJSON, &delimiter, &hasHeaders, &totalColumns)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "CSV metadata not found for this session"})
+		} else {
+			logrus.WithError(err).Error("Failed to query CSV metadata")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve CSV metadata"})
+		}
+		return
+	}
+
+	// Parse JSON fields
+	var headers []string
+	var columnPIISettings map[string]bool
+
+	if err := json.Unmarshal([]byte(headersJSON), &headers); err != nil {
+		logrus.WithError(err).Error("Failed to parse CSV headers")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse CSV headers"})
+		return
+	}
+
+	if err := json.Unmarshal([]byte(columnPIISettingsJSON), &columnPIISettings); err != nil {
+		logrus.WithError(err).Error("Failed to parse column PII settings")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse column settings"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"session_id":           sessionID,
+		"headers":              headers,
+		"column_pii_settings":  columnPIISettings,
+		"delimiter":            delimiter,
+		"has_headers":          hasHeaders,
+		"total_columns":        totalColumns,
+	})
+}
+
+// UpdateColumnPIISettings updates which columns should have PII detection enabled/disabled
+func (h *FileHandler) UpdateColumnPIISettings(c *gin.Context) {
+	sessionID := c.Param("session_id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Session ID is required"})
+		return
+	}
+
+	var req struct {
+		ColumnPIISettings map[string]bool `json:"column_pii_settings"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	// Validate that the session exists
+	var exists bool
+	err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM csv_metadata WHERE session_id = $1)`, sessionID).Scan(&exists)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to check session existence")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate session"})
+		return
+	}
+
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
+		return
+	}
+
+	// Update column PII settings
+	columnPIISettingsJSON, err := json.Marshal(req.ColumnPIISettings)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to marshal column PII settings")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process settings"})
+		return
+	}
+
+	_, err = h.db.Exec(`
+		UPDATE csv_metadata
+		SET column_pii_settings = $1
+		WHERE session_id = $2
+	`, string(columnPIISettingsJSON), sessionID)
+
+	if err != nil {
+		logrus.WithError(err).Error("Failed to update column PII settings")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update column settings"})
+		return
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"session_id": sessionID,
+		"settings":   req.ColumnPIISettings,
+	}).Info("✅ Updated column PII settings")
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":              "Column PII settings updated successfully",
+		"session_id":           sessionID,
+		"column_pii_settings":  req.ColumnPIISettings,
+	})
 }
 
 // minInt returns the minimum of two integers

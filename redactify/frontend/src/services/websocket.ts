@@ -207,28 +207,33 @@ class FileProcessingWebSocketService {
         this.ws.onmessage = (event) => {
           try {
             const message = JSON.parse(event.data);
-            
+            console.log('📨 Received WebSocket message:', message.type, message);
+
             switch (message.type) {
               case 'session_created':
                 clearTimeout(connectionTimeout);
                 this.sessionId = message.session_id;
                 console.log('📝 Processing session created:', this.sessionId);
-                if (this.sessionId) {
-                  resolve(this.sessionId);
-                } else {
-                  reject(new Error('Session ID not received'));
-                }
+                // Don't resolve here - wait for completion
                 break;
-                
+
               case 'progress_update':
+                console.log('📊 Progress update received:', message.data);
                 if (this.onProgressUpdate) {
                   this.onProgressUpdate(message.data);
                 }
                 break;
-                
+
               case 'session_completed':
+                console.log('✅ Session completed received:', message.data);
                 if (this.onComplete) {
                   this.onComplete(message.data);
+                }
+                // Resolve the promise with the session ID when processing is complete
+                if (this.sessionId) {
+                  resolve(this.sessionId);
+                } else {
+                  reject(new Error('Session completed but no session ID available'));
                 }
                 this.disconnect();
                 break;

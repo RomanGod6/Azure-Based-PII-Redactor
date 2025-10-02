@@ -208,6 +208,27 @@ func createTables(db *sql.DB) error {
 		`ALTER TABLE processing_history ADD COLUMN IF NOT EXISTS session_id TEXT`,
 		`ALTER TABLE processing_history ADD COLUMN IF NOT EXISTS redaction_mode TEXT`,
 		`ALTER TABLE processing_history ADD COLUMN IF NOT EXISTS custom_labels TEXT`,
+
+		// Add CSV metadata table for header and column configuration
+		`CREATE TABLE IF NOT EXISTS csv_metadata (
+			session_id TEXT PRIMARY KEY,
+			headers TEXT NOT NULL, -- JSON array of column headers
+			column_pii_settings TEXT, -- JSON object mapping column names to PII enable/disable
+			delimiter TEXT DEFAULT ',',
+			has_headers BOOLEAN DEFAULT TRUE,
+			total_columns INTEGER,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		// Add CSV row data table to store structured data
+		`CREATE TABLE IF NOT EXISTS csv_row_data (
+			id SERIAL PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			row_number INTEGER NOT NULL,
+			column_data TEXT NOT NULL, -- JSON array of column values
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(session_id, row_number)
+		)`,
 	}
 
 	// Performance indexes for faster queries
@@ -233,6 +254,10 @@ func createTables(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_processing_rows_session_status ON processing_rows(session_id, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_detected_entities_session_type ON detected_entities(session_id, entity_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_detected_entities_session_approved ON detected_entities(session_id, approved)`,
+
+		// CSV data indexes
+		`CREATE INDEX IF NOT EXISTS idx_csv_row_data_session_id ON csv_row_data(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_csv_row_data_session_row ON csv_row_data(session_id, row_number)`,
 	}
 
 	for _, migration := range migrations {

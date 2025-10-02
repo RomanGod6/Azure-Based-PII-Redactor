@@ -1,6 +1,7 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { FeedbackTrainer } from '../components/FeedbackTrainer';
 import { PerformanceDashboard } from '../components/PerformanceDashboard';
+import { ColumnSettings } from '../components/ColumnSettings';
 import { fileProcessingWebSocket } from '../services/websocket';
 import { sessionPersistence, SessionState } from '../services/sessionPersistence';
 import { performanceMonitor } from '../services/performanceMonitor';
@@ -70,6 +71,7 @@ export const FileProcessor: React.FC = () => {
   const [showProgressDetails, setShowProgressDetails] = useState(false);
   const [recoveredSession, setRecoveredSession] = useState<SessionState | null>(null);
   const [showPerformanceDashboard, setShowPerformanceDashboard] = useState(false);
+  const [showColumnSettings, setShowColumnSettings] = useState(false);
 
   // Performance monitoring state
   const [processingStartTime, setProcessingStartTime] = useState<number | null>(null);
@@ -1470,6 +1472,14 @@ export const FileProcessor: React.FC = () => {
               >
                 🎓 Train AI Model
               </button>
+              {currentSessionId && (
+                <button
+                  className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors"
+                  onClick={() => setShowColumnSettings(true)}
+                >
+                  ⚙️ Column Settings
+                </button>
+              )}
             </div>
             <button
               className="btn-primary"
@@ -1523,6 +1533,19 @@ export const FileProcessor: React.FC = () => {
         isOpen={showPerformanceDashboard}
         onClose={() => setShowPerformanceDashboard(false)}
       />
+
+      {/* Column Settings Modal */}
+      {currentSessionId && (
+        <ColumnSettings
+          sessionId={currentSessionId}
+          isOpen={showColumnSettings}
+          onClose={() => setShowColumnSettings(false)}
+          onSettingsUpdated={() => {
+            // Optionally refresh data when settings are updated
+            console.log('Column settings updated');
+          }}
+        />
+      )}
     </div>
   );
 };

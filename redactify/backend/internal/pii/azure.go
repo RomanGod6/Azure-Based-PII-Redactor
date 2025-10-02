@@ -89,6 +89,17 @@ func (c *AzureClient) DetectPII(text string) ([]Entity, error) {
 	}
 
 	logrus.Info("📋 AzureClient.DetectPII() - Preparing Azure request")
+
+	// Debug: Log the exact text being processed
+	textPreview := text
+	if len(text) > 100 {
+		textPreview = text[:100]
+	}
+	logrus.WithFields(logrus.Fields{
+		"text_preview": textPreview,
+		"text_full_length": len(text),
+	}).Info("🔍 DEBUG: Text content being sent to Azure")
+
 	// Prepare request
 	req := AzureRequest{
 		Documents: []AzureDocument{
@@ -99,8 +110,15 @@ func (c *AzureClient) DetectPII(text string) ([]Entity, error) {
 			},
 		},
 	}
-	
+
 	logrus.WithField("document_count", len(req.Documents)).Info("📋 AzureClient.DetectPII() - Request prepared")
+
+	// Debug: Log the request structure
+	logrus.WithFields(logrus.Fields{
+		"document_id": req.Documents[0].ID,
+		"document_language": req.Documents[0].Language,
+		"document_text_length": len(req.Documents[0].Text),
+	}).Info("🔍 DEBUG: AzureRequest structure created")
 
 	// Convert to JSON
 	logrus.Info("🔧 AzureClient.DetectPII() - Converting request to JSON")
@@ -142,10 +160,27 @@ func (c *AzureClient) DetectPII(text string) ([]Entity, error) {
 
 	// Execute request
 	logrus.Info("🌐 AzureClient.DetectPII() - Executing HTTP request to Azure")
+
+	// Debug: Log just before the actual HTTP call
+	logrus.WithFields(logrus.Fields{
+		"url": httpReq.URL.String(),
+		"method": httpReq.Method,
+		"body_length": len(jsonData),
+		"timeout": c.client.Timeout,
+	}).Info("🔍 DEBUG: About to make HTTP request - THIS IS THE CRITICAL POINT")
+
 	requestStartTime := time.Now()
+	logrus.Info("🔍 DEBUG: Calling c.client.Do(httpReq) NOW...")
+
 	resp, err := c.client.Do(httpReq)
 	requestDuration := time.Since(requestStartTime)
-	
+
+	logrus.WithFields(logrus.Fields{
+		"duration": requestDuration,
+		"has_error": err != nil,
+		"has_response": resp != nil,
+	}).Info("🔍 DEBUG: HTTP request completed")
+
 	if err != nil {
 		logrus.WithError(err).WithField("duration", requestDuration).Error("❌ AzureClient.DetectPII() - HTTP request failed")
 		return nil, fmt.Errorf("request failed: %w", err)
